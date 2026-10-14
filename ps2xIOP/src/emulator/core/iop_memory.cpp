@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
+#include <unordered_map>
 
 namespace ps2x::iop::detail
 {
@@ -31,6 +33,15 @@ namespace ps2x::iop::detail
         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
+        // Boot SPU2 2026-10-04: test A/B-2 (H2). A/B-1 probó que con
+        // ENDX=0xFFFFFF+STATX=0x80 el driver entra en modo poll, y con
+        // ceros avanza a transfers. H2: el culpable es STATX=0x80 (bit de
+        // "busy" permanente), no ENDX. Se puebla SOLO ENDX=0xFFFFFF;
+        // STATX queda en 0 (idle). Si persisten transfers → H2 confirmada
+        // y el fix es ENDX lleno + STATX idle. Si vuelve poll-storm → el
+        // culpable es ENDX y hay que modelar ciclo de voces.
+        m_hardware[0x1F900340u] = 0x00FFFFFFu;
+        m_hardware[0x1F900740u] = 0x00FFFFFFu;
         m_allocations.clear();
         m_heapCursor = HeapBase;
         m_interruptStatus = 0;
@@ -213,6 +224,21 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        // TRIAGE SPU 2026-10-04 (temporal): registra lecturas SPU2 para
+        // encontrar el bit de completitud que SDRDRV pullea. Solo primeras
+        // 3 ocurrencias por dirección (jugable-primero: entender antes de
+        // emular). mutable porque el método es const.
+        if (address >= Spu2Base && address < Spu2End)
+        {
+            static std::unordered_map<uint32_t, int> s_spuReads;
+            int &count = s_spuReads[address];
+            ++count;
+            if (count <= 3 || count % 2000 == 1)
+            {
+                std::cout << "[triage-spu] read 0x" << std::hex << address << std::dec
+                          << " total=" << count << std::endl;
+            }
+        }
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -231,6 +257,18 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        // TRIAGE SPU 2026-10-04 (temporal): idem escrituras (qué configura
+        // SDRDRV: voces, transferencia). Primeras 3 por dirección.
+        if (address >= Spu2Base && address < Spu2End)
+        {
+            static std::unordered_map<uint32_t, int> s_spuWrites;
+            int &count = s_spuWrites[address];
+            if (++count <= 3 && s_spuWrites.size() <= 64)
+            {
+                std::cout << "[triage-spu] write 0x" << std::hex << address
+                          << "=0x" << value << std::dec << " hit=" << count << std::endl;
+            }
+        }
         switch (address)
         {
         case 0x1F801070u:
@@ -249,6 +287,17 @@ namespace ps2x::iop::detail
         m_hardware[address] = value;
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
+
+        // TRIAGE SPU-DMA 2026-10-04 (temporal, jugable-primero): loguear
+        // arranques para saber si SDRDRV inicia la transferencia.
+        {
+            static int s_spuDmaStarts = 0;
+            if (++s_spuDmaStarts <= 5 || s_spuDmaStarts % 200 == 1)
+            {
+                std::cout << "[triage-spu] DMA start chcr=0x" << std::hex << address
+                          << " val=0x" << value << std::dec << " n=" << s_spuDmaStarts << std::endl;
+            }
+        }
 
         const bool secondCore = address == kDmaSpu1Chcr;
         m_hardware[address] = value & ~kDmaStart;

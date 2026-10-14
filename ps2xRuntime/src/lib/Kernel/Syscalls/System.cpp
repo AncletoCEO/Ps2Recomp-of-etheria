@@ -542,6 +542,14 @@ namespace ps2_syscalls
 
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
+        // ATAJO 2026-10-08: el heap del juego arranca ~0x180 mas abajo que en la
+        // consola (A/B con savestates), asi que el motor de DMA apunta a buffers
+        // corridos. SWORD_HEAP_PAD=N desplaza el heap base N bytes para compensar.
+        static const uint32_t s_heapPad = []() -> uint32_t {
+            const char *e = std::getenv("SWORD_HEAP_PAD");
+            return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+        }();
+
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
@@ -559,18 +567,12 @@ namespace ps2_syscalls
 
         if (runtime)
         {
-            runtime->configureGuestHeap(heapBase, heapLimit);
-
+            runtime->configureGuestHeap(heapBase + s_heapPad, heapLimit);
             PS2_IF_AGRESSIVE_LOGS({
-                std::cerr << "[SetupHeap]"
-                          << " base=0x" << std::hex << heapBaseRaw
-                          << " alignedBase=0x" << heapBase
-                          << " size=0x" << heapSize
-                          << " runtimeBase=0x" << runtime->guestHeapBase()
-                          << " runtimeEnd=0x" << runtime->guestHeapEnd()
+                std::cerr << "[SetupHeap] base=0x" << std::hex << heapBase
+                          << " pad=0x" << s_heapPad << " -> 0x" << (heapBase + s_heapPad)
                           << std::dec << std::endl;
             });
-
             setReturnU32(ctx, runtime->guestHeapBase());
             return;
         }

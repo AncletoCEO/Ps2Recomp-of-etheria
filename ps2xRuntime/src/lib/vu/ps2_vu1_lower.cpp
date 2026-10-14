@@ -93,6 +93,27 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         {
             float tmp[4];
             std::memcpy(tmp, vuData + addr, 16);
+            // 2026-10-10 DIAG: cargas de color (vf22/23/24) en el micro del draw.
+            if (it == 22u || it == 23u || it == 24u)
+            {
+                static int s_lqc = 0;
+                if (s_lqc < 60)
+                {
+                    uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                    std::memcpy(&w0, tmp, 4);
+                    std::memcpy(&w1, (const uint8_t *)tmp + 4, 4);
+                    std::memcpy(&w2, (const uint8_t *)tmp + 8, 4);
+                    std::memcpy(&w3, (const uint8_t *)tmp + 12, 4);
+                    ++s_lqc;
+                    std::cerr << "[VU1-color] vf" << static_cast<unsigned>(it)
+                              << " is=" << static_cast<unsigned>(is)
+                              << " vi=" << m_state.vi[is]
+                              << " imm=" << imm << " addr=0x" << std::hex << addr
+                              << " w=" << w0 << " " << w1 << " " << w2 << " " << w3
+                              << " | vi10=" << m_state.vi[10] << " vi11=" << m_state.vi[11]
+                              << std::dec << std::endl;
+                }
+            }
             applyDest(m_state.vf[it], tmp, dest);
         }
         return;

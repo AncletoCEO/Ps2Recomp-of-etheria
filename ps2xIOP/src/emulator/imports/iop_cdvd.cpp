@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -653,6 +654,21 @@ namespace ps2x::iop::detail
 
         bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
         {
+            // TRIAGE IOP-CDVD 2026-10-04 (temporal, jugable-primero): el
+            // EE lee sus BIN por su lado; hay que saber si el IOP
+            // (SDRDRV/SD.BIN) lee algo por acá. Primeras 5 + cada 500.
+            {
+                static int s_cdvdReads = 0;
+                ++s_cdvdReads;
+                if (s_cdvdReads <= 5 || s_cdvdReads % 500 == 0)
+                {
+                    std::ostringstream msg;
+                    msg << "[triage-cdvd] read lsn=" << lsn << " sectors=" << sectors
+                        << " dst=0x" << std::hex << destination << std::dec
+                        << " n=" << s_cdvdReads;
+                    host.log(LogLevel::Info, msg.str());
+                }
+            }
             if (sectors == 0u)
             {
                 lastError = kCdvdErrorNone;

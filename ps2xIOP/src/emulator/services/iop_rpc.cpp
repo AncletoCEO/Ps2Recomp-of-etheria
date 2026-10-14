@@ -7,14 +7,37 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <vector>
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        // 2026-10-09 (plataforma): sids que en la consola real provee el IOP BIOS
+        // (IOPRP300): sifcmd (0x80000592, 0x8000059c) y cdvdfsv (0x80000006). El
+        // recomp no carga IOPRP300, así que el IOP emulado no tiene sus servidores
+        // y el bind del EE queda en client->server=0 (el SDK reintenta). Con este
+        // flag se exponen como servidores HLE para que el bind prospere.
+        bool isIopBiosSid(uint32_t sid) noexcept
+        {
+            static const bool enabled = []() {
+                const char *e = std::getenv("SWORD_IOP_BIOS_RPC");
+                return e != nullptr && *e != '0';
+            }();
+            if (!enabled)
+                return false;
+            return sid == 0x80000592u || sid == 0x8000059cu || sid == 0x80000006u;
+        }
+    }
+
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
-        : m_host(host), m_memory(memory), m_kernel(kernel)
+        : m_host(host)
+        , m_memory(memory)
+        , m_kernel(kernel)
     {
     }
 
@@ -22,7 +45,15 @@ namespace ps2x::iop::detail
     {
         m_servers.clear();
         m_nextDmaId = 1u;
-        m_sifInitialized = false;
+        // 2026-10-09 (plataforma): en la consola real el IOP BIOS (IOPRP300)
+        // inicializa sifman ANTES de cargar los IRX del juego. Sin esto, módulos
+        // como PADMAN/DBCMAN ven sceSifCheckInit()==0 y avisan "yet sif hasn't
+        // been init". SWORD_IOP_SIF_INIT=0 para A/B.
+        static const bool preinit = []() {
+            const char *e = std::getenv("SWORD_IOP_SIF_INIT");
+            return e != nullptr && *e != '0';
+        }();
+        m_sifInitialized = preinit;
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
@@ -221,6 +252,20 @@ namespace ps2x::iop::detail
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
             m_servers[server.sid] = server;
+            // TRIAGE RPC-SERVER 2026-10-05 (temporal, visual-primero): ver
+            // qué sids registran servidor (¿0x573 de SD_CALL?). Una vez c/u.
+            {
+                static uint32_t s_loggedSids[16] = {};
+                static int s_loggedCount = 0;
+                bool seen = false;
+                for (int i = 0; i < s_loggedCount; ++i)
+                    if (s_loggedSids[i] == server.sid) { seen = true; break; }
+                if (!seen && s_loggedCount < 16) {
+                    s_loggedSids[s_loggedCount++] = server.sid;
+                    std::cout << "[triage-rpc] RegisterRpc sid=0x" << std::hex << server.sid
+                              << " func=0x" << server.function << std::dec << std::endl;
+                }
+            }
             if (server.serverData != 0u)
             {
                 m_memory.write32(server.serverData + 0x20u, server.sid);
@@ -276,9 +321,85 @@ namespace ps2x::iop::detail
     RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
     {
         RpcResult result{};
+
+        // 2026-10-09 (plataforma): servidores del IOP BIOS (IOPRP300) que el
+        // recomp no carga. Se responden en HLE para que el bind/call del EE
+        // prospere en vez de quedar "unhandled". Reply medido contra ss01
+        // (decisions.md 6).
+        if (isIopBiosSid(request.sid))
+        {
+            uint32_t reply[4] = {1u, 0x873280u, 0x8001F930u, 0x10u};
+            if (request.sid == 0x8000059cu)
+            {
+                reply[0] = 2u;
+                reply[1] = request.receive.address;
+            }
+            else if (request.sid == 0x80000006u)
+            {
+                reply[0] = 0x20u;
+                reply[1] = 2u;
+            }
+            if (request.receive.address != 0u && request.receive.size != 0u)
+            {
+                const uint32_t copySize = std::min<uint32_t>(request.receive.size, sizeof(reply));
+                (void)m_host.writeGuest(request.receive.address, reply, copySize);
+            }
+            result.handled = true;
+            result.resultAddress = request.receive.address;
+            result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+            result.signalNowaitCompletion = true;
+            result.signalCompletion = true;
+            return result;
+        }
+
         const auto serverIt = m_servers.find(request.sid);
         if (serverIt == m_servers.end() || serverIt->second.function == 0u)
             return result;
+
+        // TRIAGE RPC-DATA 2026-10-06 (temporal, visual-primero): qué recibe
+        // el servidor 0x573 por transfer. 2026-10-06b: volcado COMPLETO del
+        // comando (4 words = 16 B) + detección de cambios. Sin esto no se
+        // puede implementar el bulk-serve de SD.BIN (tarea 4.6-4).
+        if (request.sid == 0x573u && request.function == 0x30000u)
+        {
+            static int s_rpcLog = 0;
+            uint32_t w[4] = {};
+            uint8_t tmp[16] = {};
+            if (request.send.size >= 16 &&
+                m_host.readGuest(request.send.address, tmp, sizeof(tmp)))
+                std::memcpy(w, tmp, sizeof(w));
+            static uint32_t s_last[4] = {};
+            bool changed = (w[0] != s_last[0] || w[1] != s_last[1] ||
+                            w[2] != s_last[2] || w[3] != s_last[3]);
+            if (++s_rpcLog <= 5 || changed)
+            {
+                s_last[0] = w[0]; s_last[1] = w[1];
+                s_last[2] = w[2]; s_last[3] = w[3];
+                std::cout << "[triage-rpc] sid=0x573 rpc=0x30000 send=(" << request.send.address << "," << request.send.size << ")"
+                          << " cmd=0x" << std::hex << w[0] << " 0x" << w[1] << " 0x" << w[2] << " 0x" << w[3] << std::dec
+                          << " serverBuf=0x" << std::hex << serverIt->second.buffer << std::dec
+                          << " n=" << s_rpcLog << (changed ? " CHANGED" : "") << std::endl;
+            }
+        }
+        else if (request.sid == 0x573u)
+        {
+            static int s_rpcLog = 0;
+            if (++s_rpcLog <= 3 || s_rpcLog % 100 == 1)
+            {
+                uint32_t w0 = 0, w1 = 0;
+                uint8_t tmp[8] = {};
+                if (request.send.size >= 8 &&
+                    m_host.readGuest(request.send.address, tmp, sizeof(tmp)))
+                {
+                    std::memcpy(&w0, tmp, 4);
+                    std::memcpy(&w1, tmp + 4, 4);
+                }
+                std::cout << "[triage-rpc] sid=0x573 rpc=" << request.function
+                          << " send=(" << request.send.address << "," << request.send.size << ")"
+                          << " w0=0x" << std::hex << w0 << " w1=0x" << w1 << std::dec
+                          << " n=" << s_rpcLog << std::endl;
+            }
+        }
 
         RpcServer &server = serverIt->second;
         if (request.send.size != 0u && server.buffer != 0u)
@@ -298,6 +419,41 @@ namespace ps2x::iop::detail
                                                                request.send.size,
                                                                0u,
                                                                server.gp);
+        // 2026-10-06c (desbloqueo): ¿el handler 0x573 tocó el buffer?
+        // Si el payload copiado sigue intacto y returnPointer == buffer,
+        // el handler no hizo nada (tomó la rama "busy"/default).
+        if (request.sid == 0x573u && request.function == 0x30000u)
+        {
+            static int s_retLog = 0;
+            if (++s_retLog <= 3)
+            {
+                uint32_t b[4] = {};
+                for (int i = 0; i < 4; ++i)
+                    m_memory.readRam(server.buffer + i * 4u, &b[i], 4u);
+                // 2026-10-06d: volcar la STRUCT de reply (ret=0x534D0,
+                // buffer+0x400) que el handler devuelve. Si son ceros, el
+                // handler tomó la rama busy sin hacer nada.
+                // 2026-10-06j: ADEMÁS peek del global de helper#1 (IOP
+                // 0xC560, absoluto sin reloc): 0 = rama éxito (mueve datos
+                // buffer→tabla), !=0 = rama busy. Sin este dato no se sabe
+                // ni qué rama toma.
+                uint32_t r[8] = {};
+                for (int i = 0; i < 8; ++i)
+                    m_memory.readRam(returnPointer + i * 4u, &r[i], 4u);
+                uint32_t g_c560 = 0xDEADBEEFu, g_c0fe = 0xDEADBEEFu;
+                m_memory.readRam(0xC560u, &g_c560, 4u);
+                uint8_t c0fe = 0xEE;
+                m_memory.readRam(0xC0FEu, &c0fe, 1u);
+                g_c0fe = c0fe;
+                std::cout << "[triage-rpc] sid=0x573 rpc=0x30000 ret=0x" << std::hex << returnPointer
+                          << " buf=0x" << server.buffer
+                          << " b0=0x" << b[0] << " b1=0x" << b[1] << " b2=0x" << b[2] << " b3=0x" << b[3]
+                          << " | reply=" << r[0] << " " << r[1] << " " << r[2] << " " << r[3]
+                          << " " << r[4] << " " << r[5] << " " << r[6] << " " << r[7]
+                          << " | gC560=0x" << g_c560 << " stC0FE=0x" << g_c0fe
+                          << std::dec << " n=" << s_retLog << std::endl;
+            }
+        }
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
@@ -343,6 +499,8 @@ namespace ps2x::iop::detail
 
     bool IopRpcBridge::hasServer(uint32_t sid) const noexcept
     {
+        if (isIopBiosSid(sid))
+            return true;
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
     }

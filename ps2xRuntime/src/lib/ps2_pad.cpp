@@ -1,6 +1,8 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 
 namespace
 {
@@ -117,6 +119,29 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+    }
+
+    // SWORD_PAD_PRESS=<start|cross|circle|square|triangle|select|up|down|left|right>
+    // pulsa un botón de forma permanente (harness headless: sin esto el pad queda neutro).
+    // SWORD_PAD_TOGGLE=1 alterna 1 s on / 1 s off para generar flancos (no sólo el inicial).
+    if (const char *pe = std::getenv("SWORD_PAD_PRESS"); pe != nullptr && *pe != '\0')
+    {
+        bool on = true;
+        if (std::getenv("SWORD_PAD_TOGGLE") != nullptr)
+            on = std::fmod(GetTime(), 2.0) < 1.0;
+        if (on)
+        {
+            if (std::strcmp(pe, "start") == 0) clearBit(PAD_START);
+            else if (std::strcmp(pe, "cross") == 0) clearBit(PAD_CROSS);
+            else if (std::strcmp(pe, "circle") == 0) clearBit(PAD_CIRCLE);
+            else if (std::strcmp(pe, "square") == 0) clearBit(PAD_SQUARE);
+            else if (std::strcmp(pe, "triangle") == 0) clearBit(PAD_TRIANGLE);
+            else if (std::strcmp(pe, "select") == 0) clearBit(PAD_SELECT);
+            else if (std::strcmp(pe, "up") == 0) clearBit(PAD_UP);
+            else if (std::strcmp(pe, "down") == 0) clearBit(PAD_DOWN);
+            else if (std::strcmp(pe, "left") == 0) clearBit(PAD_LEFT);
+            else if (std::strcmp(pe, "right") == 0) clearBit(PAD_RIGHT);
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

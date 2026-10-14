@@ -188,6 +188,17 @@ namespace ps2_syscalls
     void CreateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t address = getRegU32(ctx, 4);
+        // 2026-10-07n (triage fallos, REVERSIBLE): loguear params y rama.
+        {
+            uint32_t w[9] = {0};
+            if (address != 0u) {
+                for (int i = 0; i < 9; ++i) {
+                    const uint32_t a = (address + i * 4u) & 0x01FFFFFFu;
+                    if (a + 4 <= 0x02000000u) std::memcpy(&w[i], rdram + a, 4);
+                }
+            }
+            RUNTIME_LOG("[ee-thread] create-attempt ra=0x" << std::hex << getRegU32(ctx, 31) << " param=0x" << address << " func=0x" << w[1] << " stack=0x" << w[2] << " size=0x" << w[3] << " gp=0x" << w[4] << " prio=" << std::dec << (int32_t)w[5] << " attr=0x" << std::hex << w[7] << std::dec);
+        }
         if (address == 0u)
         {
             setReturnS32(ctx, KE_ERROR);
@@ -231,6 +242,9 @@ namespace ps2_syscalls
             param->option,
         };
         setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        // 2026-10-07m (triage, REVERSIBLE): sitio creador (pc del syscall + ra
+        // al llamador del trampolín).
+        RUNTIME_LOG("[ee-thread] create-site pc=0x" << std::hex << ctx->pc << " ra=0x" << getRegU32(ctx, 31) << std::dec);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

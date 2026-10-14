@@ -110,6 +110,20 @@ namespace ps2_syscalls
                 return;
             }
 
+            // 2026-10-09 (Fase 1 reach-main-menu): ¿las RPC sin réplica se
+            // repiten (posible espera del state machine) o son de un solo uso?
+            {
+                static uint64_t s_unhandled = 0;
+                if (++s_unhandled <= 60ull || (s_unhandled % 500ull) == 0ull)
+                {
+                    std::cerr << "[rpc-unhandled] n=" << s_unhandled
+                              << " sid=0x" << std::hex << event.sid
+                              << " rpc=0x" << event.rpcNum
+                              << " pc=0x" << event.pc
+                              << std::dec << std::endl;
+                }
+            }
+
             uint64_t signature = 1469598103934665603ull;
             auto mixSignature = [&](uint32_t value)
             {
@@ -554,6 +568,15 @@ namespace ps2_syscalls
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }
+
+            // Sword of Etheria: on the console the SIF DMA-completion interrupt posts the
+            // SDK SIF-manager semaphore (id 3), which wakes the dispatcher thread at
+            // FUN_004d3fa0. The HLE RPC path never raises that interrupt, so emulate it by
+            // posting sema 3 after each RPC round-trip. Env-gated for A/B.
+            if (std::getenv("SWORD_SIF_SEMA") != nullptr)
+            {
+                (void)runtime->eeScheduler().signalSemaphore(3, true);
+            }
         }
 
         uint32_t guestFunction = iopResult.guestFunction;
@@ -648,6 +671,10 @@ namespace ps2_syscalls
             };
 
             setReturnS32(&parent, 0);
+            if (getRegU32(&parent, 31) != 0u)
+            {
+                parent.pc = getRegU32(&parent, 31);
+            }
             if (endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
             {
                 completeClient(parent, endFunction != 0u);

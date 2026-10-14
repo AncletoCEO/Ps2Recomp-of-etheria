@@ -1,4 +1,5 @@
 #include "iop_emulator.h"
+#include <iostream>
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
 #include "imports/iop_heaplib.h"
@@ -23,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -342,6 +344,103 @@ namespace ps2x::iop::detail
             if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
+            // TRIAGE audio 2026-10-04 (temporal): SDRDRV pullea libsd:6
+            // (pc=0x25474, miles de hits, v0=0 por Missing) y nunca avanza;
+            // el EE espera el stream (spin 0x6e4d98, pantalla negra/magenta).
+            // Se responde 1 ("done") para clasificar si desbloquea.
+            // 2026-10-04b: libsd:6 OK (0 warnings) pero SDRDRV pasó a
+            // pullear libsd:5 (509 hits) y libsd:7 (142) — misma hipótesis.
+            // 2026-10-04c (tarea 3): si el IRX físico registró exports reales,
+            // se salta al código Sony (JumpToGuest) y el stub solo queda como
+            // fallback. NO es fix real (el estado SPU subyacente sigue sin
+            // emularse).
+            // 2026-10-06i: log genérico de TODO import anidado (depth>=1)
+            // durante transfers: el helper#2 del handler llama a un import
+            // desconocido (libsd? sysmem? sifcmd?) y ramifica por su
+            // retorno. Nombrarlo = nombrar el waiter.
+            {
+                extern bool g_tyosdTransferActive;
+                if (g_tyosdTransferActive && callDepth >= 1u)
+                {
+                    static int s_nestedDuring = 0;
+                    if (++s_nestedDuring <= 60)
+                    {
+                        std::ostringstream nested;
+                        nested << "[triage-iop] NESTED-DURING " << call.library << ":" << call.ordinal
+                               << " a0=0x" << std::hex << cpu.gpr[4]
+                               << " ra=0x" << cpu.gpr[31] << std::dec
+                               << " n=" << s_nestedDuring;
+                        log(LogLevel::Warning, nested.str());
+                    }
+                }
+            }
+            if (iequals(call.library, "libsd") && (call.ordinal == 5u || call.ordinal == 6u || call.ordinal == 7u))
+            {
+                // TRIAGE correlación 2026-10-05: loguear llamadas DURANTE
+                // transfers 0x30000 (flag de game_overrides). Cap total 400.
+                extern bool g_tyosdTransferActive;
+                if (g_tyosdTransferActive)
+                {
+                    static int s_duringCount = 0;
+                    if (++s_duringCount <= 400)
+                    {
+                        std::ostringstream during;
+                        during << "[triage-iop] DURING-TRANSFER libsd:" << call.ordinal
+                               << " a0=0x" << std::hex << cpu.gpr[4]
+                               << " a1=0x" << cpu.gpr[5]
+                               << " ra=0x" << cpu.gpr[31]
+                               << " depth=" << std::dec << callDepth
+                               << " n=" << s_duringCount;
+                        log(LogLevel::Warning, during.str());
+                    }
+                }
+                const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
+                if (target != 0u)
+                {
+                    // 2026-10-04d (jugable-primero): confirma qué ordinales
+                    // usan código real y desde dónde (ra = llamador).
+                    // 2026-10-04e: además registra a0 (1ros 3 + cada 500) en
+                    // GetParam/SetParam/SetSwitch para saber QUÉ registro SPU
+                    // pullea el waiter (antes de adivinar valores).
+                    static uint32_t loggedRealMask = 0u;
+                    const uint32_t bit = 1u << (call.ordinal & 31u);
+                    if ((loggedRealMask & bit) == 0u)
+                    {
+                        loggedRealMask |= bit;
+                        std::ostringstream real;
+                        real << "[triage-iop] libsd:" << call.ordinal << " real code -> 0x"
+                             << std::hex << target << " ra=0x" << cpu.gpr[31];
+                        log(LogLevel::Warning, real.str());
+                    }
+                    {
+                        static std::unordered_map<uint32_t, int> s_argHits;
+                        int &hits = s_argHits[call.ordinal];
+                        if (++hits <= 3 || hits % 500 == 1)
+                        {
+                            std::ostringstream args;
+                            args << "[triage-iop] libsd:" << call.ordinal
+                                 << " a0=0x" << std::hex << cpu.gpr[4]
+                                 << " a1=0x" << cpu.gpr[5] << std::dec
+                                 << " n=" << hits;
+                            log(LogLevel::Warning, args.str());
+                        }
+                    }
+                    cpu.pc = target;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
+                static bool loggedLibsd6 = false;
+                if (!loggedLibsd6)
+                {
+                    loggedLibsd6 = true;
+                    std::ostringstream triage;
+                    triage << "[triage-iop] libsd:5/6/7 HLE done (v0=1) pc=0x" << std::hex << cpu.pc;
+                    log(LogLevel::Warning, triage.str());
+                }
+                setV0(1);
+                return ImportDisposition::Handled;
+            }
+
             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
             if (target != 0u)
             {
@@ -352,7 +451,8 @@ namespace ps2x::iop::detail
 
             std::ostringstream out;
             out << "[IOP] unhandled import " << call.library << ':' << call.ordinal
-                << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc;
+                << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc
+                << " ra=0x" << cpu.gpr[31];
             log(LogLevel::Warning, out.str());
             setV0(0);
             return ImportDisposition::Missing;
@@ -431,6 +531,22 @@ namespace ps2x::iop::detail
 
             const uint32_t depth = callDepth++;
             const CallDepthGuard depthGuard{callDepth};
+            // 2026-10-06h (desbloqueo, temporal): nombrar a qué funciones
+            // Sony llama el handler 0x30000 (helpers = imports libsd).
+            // Solo rangos de módulos Sony + primeras 12 (no es hot path:
+            // solo llamadas anidadas RPC/callbacks).
+            {
+                static int s_sonyCallLog = 0;
+                const bool inSony = (address >= 0x39f00u && address < 0x47500u) ||
+                                    (address >= 0x80b00u && address < 0x8a000u);
+                if (inSony && ++s_sonyCallLog <= 12)
+                {
+                    std::cout << "[triage-iop] nestedCall5911 0x" << std::hex << address
+                              << " a0=0x" << a0 << " a1=0x" << a1 << " a2=0x" << a2
+                              << " depth=" << std::dec << depth
+                              << " n=" << s_sonyCallLog << std::endl;
+                }
+            }
             CpuState cpu{};
             cpu.pc = address;
             cpu.gpr[4] = a0;

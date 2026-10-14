@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -228,6 +229,22 @@ void EeScheduler::run()
 
         publishDebugContext(context);
 
+        // 2026-10-09 (Fase 0): histograma de pc de dispatch del EE (muestra
+        // 1/500; se agrega con `grep | sort | uniq -c`). Env: SWORD_PC_HIST=1.
+        {
+            static const bool s_pcHist = []() {
+                const char *e = std::getenv("SWORD_PC_HIST");
+                return e != nullptr && *e != '0';
+            }();
+            if (s_pcHist) {
+                static uint64_t s_pcN = 0;
+                if ((++s_pcN % 500ull) == 0ull) {
+                    RUNTIME_LOG("[pc-h] pc=0x" << std::hex << context.pc
+                                << " tid=" << std::dec << m_currentThreadId);
+                }
+            }
+        }
+
         if (context.pc == 0u)
         {
             if (!running->invocations.empty())
@@ -268,8 +285,44 @@ void EeScheduler::run()
 
         if (!m_runtime.hasFunction(context.pc))
         {
+            // 2026-10-09: GAPS de recompilacion. Ghidra corta funciones (p.ej. justo
+            // tras 'syscall'): el recomp no genera el 'jr $ra' que sigue. Emular
+            // localmente las instrucciones triviales del gap en vez de matar el hilo.
+            bool gapAdvanced = false;
+            const uint32_t gapPc = context.pc;
+            if (gapPc + 4u <= PS2_RAM_SIZE)
+            {
+                uint32_t w = 0;
+                std::memcpy(&w, m_rdram + gapPc, 4);
+                if (w == 0x03e00008u) // jr $ra
+                {
+                    context.pc = getRegU32(&context, 31);
+                    gapAdvanced = true;
+                }
+                else if (w == 0x00000000u) // nop
+                {
+                    context.pc = gapPc + 4u;
+                    gapAdvanced = true;
+                }
+            }
+            if (gapAdvanced)
+            {
+                static int s_gapN = 0;
+                if (s_gapN++ < 40)
+                {
+                    std::cerr << "[gap] pc=0x" << std::hex << gapPc << std::dec << std::endl;
+                }
+                continue;
+            }
             if (!running->invocations.empty())
             {
+                static std::atomic<uint32_t> s_silentMiss{0};
+                const uint32_t sn = s_silentMiss.fetch_add(1, std::memory_order_relaxed);
+                if (sn < 200u)
+                {
+                    std::cerr << "[gap-silent] pc=0x" << std::hex << gapPc << std::dec
+                              << " n=" << sn << std::endl;
+                }
                 context.pc = 0u;
             }
             else
@@ -423,7 +476,11 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // 2026-10-07o (prio 0, REVERSIBLE): el juego crea su worker con
+    // initial_priority=0 y espera éxito (bgez). El propio main corre a
+    // prio 0 (readyQueues[0]) y el rango HW es 0-127: rechazarlo es
+    // inconsistencia del runtime, no del juego. Aceptar 0..127.
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -437,6 +494,8 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
     GuestThread thread{};
     thread.id = id;
     thread.entry = params.entry;
+    // 2026-10-07l (triage EE threads, REVERSIBLE): quién crea qué hilo.
+    RUNTIME_LOG("[ee-thread] created id=" << id << " entry=0x" << std::hex << params.entry << " gp=0x" << params.gp << std::dec << " prio=" << params.priority << " stack=0x" << std::hex << params.stack << std::dec);
     thread.stack = params.stack;
     thread.stackSize = params.stackSize;
     thread.gp = params.gp;
@@ -504,6 +563,8 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     SET_GPR_U32(&target->context, 31, 0u);
     enqueueReady(*target);
     requestPreemptionIfHigher(*target, interruptSafe);
+    // 2026-10-07l (triage EE threads, REVERSIBLE).
+    RUNTIME_LOG("[ee-thread] started id=" << id << " entry=0x" << std::hex << target->entry << std::dec << " arg=0x" << std::hex << arg << std::dec);
     publishSnapshot();
     return KE_OK;
 }
@@ -809,6 +870,11 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     {
         GuestThread *self = currentThread();
         assert(self != nullptr);
+        const uint32_t ra = getRegU32(&self->activeContext(), 31);
+        if (ra != 0u)
+        {
+            self->activeContext().pc = ra;
+        }
         enqueueReady(*self, true);
         m_currentThreadId = 0;
     }
@@ -1207,6 +1273,8 @@ int EeScheduler::addIrqHandler(bool dmac,
                                   sp,
                                   true,
                                   append ? ++tail : --head});
+    // 2026-10-07q (triage IRQ, REVERSIBLE): qué handlers registra el juego.
+    RUNTIME_LOG("[ee-irq] add " << (dmac ? "dmac" : "intc") << " cause=" << cause << " handler=0x" << std::hex << handler << std::dec << " id=" << id);
     return id;
 }
 
@@ -1275,6 +1343,11 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
               { return left.order < right.order; });
     for (const EeIrqHandler &handler : matching)
     {
+        // 2026-10-07q (triage IRQ, REVERSIBLE): contar dispatches por causa.
+        static uint64_t s_irqCount[32] = {0};
+        if (cause < 32u && ++s_irqCount[cause] % 600 == 1) {
+            RUNTIME_LOG("[ee-irq] dispatch " << (dmac ? "dmac" : "intc") << " cause=" << cause << " n=" << s_irqCount[cause] << " handler=0x" << std::hex << handler.handler << std::dec);
+        }
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::Interrupt;
         invocation.context.pc = handler.handler;
@@ -1687,6 +1760,11 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
+    const uint32_t ra = getRegU32(&self->activeContext(), 31);
+    if (ra != 0u)
+    {
+        self->activeContext().pc = ra;
+    }
     publishSnapshot();
     throw EeDispatcherTransfer{};
 }
@@ -1784,7 +1862,7 @@ void EeScheduler::processDueDeadlines()
             const auto now = std::chrono::steady_clock::now();
             for (const ScheduledEvent &item : m_deadlines)
             {
-                if (item.deadlineCycle <= m_eeCycle &&
+                if ((item.deadlineCycle <= m_eeCycle || item.hostDeadline <= now) &&
                     (pacingDeadline == std::chrono::steady_clock::time_point{} ||
                      item.hostDeadline < pacingDeadline))
                 {
@@ -1813,13 +1891,32 @@ void EeScheduler::processDueDeadlines()
             const auto pacedNow = std::chrono::steady_clock::now();
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
                                               [this, pacedNow](const ScheduledEvent &item)
-                                              { return item.deadlineCycle <= m_eeCycle &&
+                                              { return (item.deadlineCycle <= m_eeCycle || item.hostDeadline <= pacedNow) &&
                                                        item.hostDeadline <= pacedNow; });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
             m_deadlines.erase(m_deadlines.begin(), firstFuture);
             updateNextDeadline();
+        }
+
+        uint64_t maxDueCycle = m_eeCycle;
+        for (const ScheduledEvent &scheduled : due)
+        {
+            if (scheduled.deadlineCycle > maxDueCycle)
+            {
+                maxDueCycle = scheduled.deadlineCycle;
+            }
+        }
+        if (maxDueCycle > m_eeCycle)
+        {
+            uint64_t remaining = maxDueCycle - m_eeCycle;
+            while (remaining > 0u)
+            {
+                const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+                accountCycles(step);
+                remaining -= step;
+            }
         }
 
         std::sort(due.begin(), due.end(), [](const ScheduledEvent &left, const ScheduledEvent &right)
@@ -1871,11 +1968,12 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
-            m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
+            m_runtime.memory().gs().csr.fetch_or(0x6000ull, std::memory_order_acq_rel);
         }
         else
         {
             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
+            m_runtime.memory().gs().csr.fetch_or(0x4000ull, std::memory_order_acq_rel);
         }
         writeGuestU32(m_vsyncFlagAddress, 1u);
         if (m_vsyncTickAddress != 0u)

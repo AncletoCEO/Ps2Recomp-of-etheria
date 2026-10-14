@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <iostream>
 
 namespace ps2x::iop::detail
 {
@@ -184,6 +185,35 @@ namespace ps2x::iop::detail
         case 24: // SleepThread
             if (m_currentThread != nullptr)
             {
+                // TRIAGE IOP-THREAD 2026-10-04 (temporal, jugable-primero):
+                // ver qué hilos duermen eternamente (SDRDRV sin registrar
+                // server 0x573 sugiere init atascado en sleep/wait).
+                static int s_sleepLog = 0;
+                if (++s_sleepLog <= 8 || s_sleepLog % 2000 == 1)
+                {
+                    std::cout << "[triage-iop] SleepThread id=" << m_currentThread->id
+                              << " pc=0x" << std::hex << cpu.pc << std::dec
+                              << " n=" << s_sleepLog << std::endl;
+                }
+                // 2026-10-06c (desbloqueo): volcado único de TODA la tabla
+                // de hilos (¿los threads de SDRDRV existen? ¿en qué estado
+                // y con qué prioridad? Si están Dormant/Sleep eternos, el
+                // handler 0x30000 espera algo que nunca corre).
+                {
+                    static bool s_threadDump = false;
+                    if (!s_threadDump && s_sleepLog >= 6) {
+                        s_threadDump = true;
+                        for (const auto &kv : m_threads) {
+                            const IopThread &t = kv.second;
+                            std::cout << "[triage-iop] thread id=" << t.id
+                                      << " state=" << static_cast<int>(t.state)
+                                      << " entry=0x" << std::hex << t.entry
+                                      << " pc=0x" << t.cpu.pc
+                                      << " prio=0x" << t.priority
+                                      << " waitId=" << std::dec << t.waitId << std::endl;
+                        }
+                    }
+                }
                 if (m_currentThread->wakeupCount > 0)
                     --m_currentThread->wakeupCount;
                 else
@@ -195,6 +225,17 @@ namespace ps2x::iop::detail
         case 26:
         {
             const int id = static_cast<int>(cpu.gpr[4]);
+            // TRIAGE IOP-THREAD 2026-10-06 (temporal, visual-primero): ver
+            // QUIÉN despierta a QUIÉN (el sleeper del audio espera un
+            // wakeup que quizá nunca llega).
+            static int s_wakeLog = 0;
+            if (++s_wakeLog <= 8 || s_wakeLog % 2000 == 1)
+            {
+                std::cout << "[triage-iop] WakeupThread target=" << id
+                          << " from=" << (m_currentThread ? m_currentThread->id : -1)
+                          << " pc=0x" << std::hex << cpu.pc << std::dec
+                          << " n=" << s_wakeLog << std::endl;
+            }
             const auto it = m_threads.find(id);
             if (it == m_threads.end())
             {

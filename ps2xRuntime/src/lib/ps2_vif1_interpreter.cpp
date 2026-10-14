@@ -469,6 +469,30 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t destAddr = (uint32_t)imm * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            // 2026-10-09 (SWORD_MICRO_B): el juego sube el micro "set A" (0x83F190); cargar
+            // el "set B" (renderer 3D, 0x8A5A40) para A/B: probar si el micro es el bloqueo.
+            static const bool s_microB = std::getenv("SWORD_MICRO_B") != nullptr;
+            if (s_microB && m_rdram && pos + 4u <= sizeBytes &&
+                *reinterpret_cast<const uint32_t*>(data + pos) == 0x102e07f0u)
+            {
+                const uint8_t *bSrc = m_rdram + 0x008A5A40u;
+                const uint32_t bBytes = 2048u;
+                if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE)
+                {
+                    uint32_t cpy = bBytes;
+                    if (destAddr + cpy > PS2_VU1_CODE_SIZE)
+                        cpy = PS2_VU1_CODE_SIZE - destAddr;
+                    std::memcpy(m_vu1Code + destAddr, bSrc, cpy);
+                    markVU1CodeModified();
+                    static int s_b = 0;
+                    if (++s_b <= 4)
+                        std::cerr << "[MPG-B] set A -> set B (" << cpy << " B)" << std::endl;
+                }
+                pos += mpgBytes;
+                if (pos > sizeBytes)
+                    break;
+                continue;
+            }
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;
@@ -478,6 +502,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
+                    {
+                        static int s_mpg = 0;
+                        if (++s_mpg <= 8)
+                        {
+                            std::cerr << "[MPG] #" << s_mpg << " dest=0x" << std::hex << destAddr
+                                      << " bytes=" << std::dec << copyBytes << " first="
+                                      << std::hex << (copyBytes > 0 ? *reinterpret_cast<const uint32_t*>(data + pos) : 0u)
+                                      << std::dec << std::endl;
+                        }
+                    }
+                }
+                else
+                {
+                    static int s_mpgf = 0;
+                    if (++s_mpgf <= 8)
+                        std::cerr << "[MPG] #" << s_mpgf << " FAIL pos=" << pos << " copyBytes=" << copyBytes
+                                  << " sizeBytes=" << sizeBytes << std::endl;
                 }
             }
             pos += mpgBytes;
@@ -571,6 +612,31 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+            {
+                static int s_unpack = 0;
+                if (++s_unpack <= 400)
+                {
+                    uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                    if (pos + 16u <= sizeBytes)
+                    {
+                        std::memcpy(&s0, data + pos, 4);
+                        std::memcpy(&s1, data + pos + 4, 4);
+                        std::memcpy(&s2, data + pos + 8, 4);
+                        std::memcpy(&s3, data + pos + 12, 4);
+                    }
+                    std::cerr << "[UNPACK] #" << s_unpack << " opcode=0x" << std::hex << static_cast<unsigned>(opcode)
+                              << " vn=" << std::dec << static_cast<unsigned>(vn) << " vl=" << static_cast<unsigned>(vl)
+                              << " msk=" << (maskEnable ? 1 : 0) << " mode=" << vif1_regs.mode
+                              << " cyc=0x" << std::hex << vif1_regs.cycle
+                              << " vuAddr=0x" << vuAddr << " len=" << std::dec << totalBytes
+                              << " vecs=" << writeVectorCount
+                              << " m=0x" << std::hex << vif1_regs.mask
+                              << " row=" << vif1_regs.row[0] << " " << vif1_regs.row[1] << " " << vif1_regs.row[2] << " " << vif1_regs.row[3]
+                              << " col=" << vif1_regs.col[0] << " " << vif1_regs.col[1] << " " << vif1_regs.col[2] << " " << vif1_regs.col[3]
+                              << " src=" << s0 << " " << s1 << " " << s2 << " " << s3 << std::dec << std::endl;
+                }
+            }
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {

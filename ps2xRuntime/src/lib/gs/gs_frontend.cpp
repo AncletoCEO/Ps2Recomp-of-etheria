@@ -10,6 +10,9 @@
 #include <iostream>
 #include <sstream>
 
+// 2026-10-10 DIAG render: último pc guest de un Store (definido en ps2_runtime.cpp).
+extern uint32_t g_lastStorePc;
+
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
@@ -658,6 +661,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if (nreg == 0u)
                 nreg = 16u;
             RUNTIME_LOG("[gs:gif] idx=" << packetIndex
+                                        << " pc=0x" << std::hex << g_lastStorePc << std::dec
                                         << " size=" << sizeBytes
                                         << " nloop=" << nloop
                                         << " flg=" << static_cast<uint32_t>(flg)
@@ -665,6 +669,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                         << " ctx0fbp=" << m_ctx[0].frame.fbp
                                         << " ctx1fbp=" << m_ctx[1].frame.fbp
                                         << std::endl);
+            // 2026-10-10 DIAG: primeros regs crudos del payload (lo de cada qword 16B).
+            auto pay = [&](uint32_t q) -> uint64_t {
+                const uint32_t o = 16u + q * 16u;
+                return (o + 8u <= sizeBytes) ? loadLE64(data + o) : 0ull;
+            };
+            RUNTIME_LOG("[gs:gif]   tagHi=0x" << std::hex << loadLE64(data + 8)
+                        << " regs=" << pay(0) << " " << pay(1) << " " << pay(2) << " " << pay(3)
+                        << std::dec << std::endl);
         }
     });
 
@@ -1166,6 +1178,20 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         std::memcpy(&m_curQ, &qBits, 4);
         if (m_curQ == 0.0f)
             m_curQ = 1.0f;
+        // TRIAGE 2026-10-08: ¿el juego escribe RGBAQ en algún momento?
+        {
+            static uint32_t s_rgbaqWrites = 0;
+            if (s_rgbaqWrites < 8u) {
+                RUNTIME_LOG("[gs:rgbaq] write#" << s_rgbaqWrites
+                             << " rgba=("
+                             << static_cast<uint32_t>(m_curR) << ","
+                             << static_cast<uint32_t>(m_curG) << ","
+                             << static_cast<uint32_t>(m_curB) << ","
+                             << static_cast<uint32_t>(m_curA) << ")"
+                             << std::endl);
+            }
+            ++s_rgbaqWrites;
+        }
         break;
     }
     case GS_REG_ST:
@@ -1537,7 +1563,8 @@ void GS::vertexKick(bool drawing)
                                          << " drawing=" << static_cast<uint32_t>(drawing ? 1u : 0u)
                                          << " prim=" << static_cast<uint32_t>(m_prim.type)
                                          << " vtxCount=" << m_vtxCount
-                                         << std::endl);
+                                         << " pc=0x" << std::hex << g_lastStorePc
+                                         << std::dec << std::endl);
         }
     });
 
@@ -1571,6 +1598,40 @@ void GS::vertexKick(bool drawing)
 
     if (m_vtxCount < needed)
         return;
+
+    // 2026-10-08 TRIAGE: loguear color+posición de los primeros 20 kicks y
+    // forzar rojo brillante si el color es negro (atajo para ver si el
+    // backend rasteriza o no).
+    {
+        // Contadores (sin cap): ¿el juego alguna vez dibuja CON contenido?
+        static uint64_t s_total = 0, s_colored = 0, s_textured = 0, s_interesting = 0;
+        ++s_total;
+        const GSVertex &v = m_vtxQueue[(m_vtxCount - 1) % kMaxVerts];
+        const bool hasColor = (v.r != 0 || v.g != 0 || v.b != 0);
+        const GSTex0Reg &t0 = m_ctx[m_prim.ctxt ? 1 : 0].tex0;
+        if (hasColor) ++s_colored;
+        if (m_prim.tme) ++s_textured;
+        if ((hasColor || m_prim.tme) && s_interesting < 12u) {
+            ++s_interesting;
+            RUNTIME_LOG("[gs:content] #" << s_total
+                         << " prim=" << static_cast<uint32_t>(m_prim.type)
+                         << " tme=" << static_cast<uint32_t>(m_prim.tme ? 1u : 0u)
+                         << " tex0(tbp0=" << t0.tbp0 << " tbw=" << static_cast<uint32_t>(t0.tbw)
+                         << " psm=" << static_cast<uint32_t>(t0.psm)
+                         << " tw=" << static_cast<uint32_t>(t0.tw)
+                         << " th=" << static_cast<uint32_t>(t0.th) << ")"
+                         << " uv=(" << v.u << "," << v.v << ")"
+                         << " rgba=(" << static_cast<uint32_t>(v.r) << ","
+                         << static_cast<uint32_t>(v.g) << ","
+                         << static_cast<uint32_t>(v.b) << ","
+                         << static_cast<uint32_t>(v.a) << ")" << std::endl);
+        }
+        if ((s_total % 20000u) == 0u) {
+            RUNTIME_LOG("[gs:content] TOTAL kicks=" << s_total
+                         << " colored=" << s_colored
+                         << " textured=" << s_textured << std::endl);
+        }
+    }
 
     if (drawing && m_backend)
     {

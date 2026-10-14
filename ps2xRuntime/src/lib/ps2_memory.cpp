@@ -3,12 +3,220 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <csignal>
+#include <cstdio>
+#include <cerrno>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <ucontext.h>
+#endif
+
+// SWORD_WP_WRITER (2026-10-11): hook de ESCRITORES a una region de RDRAM por
+// proteccion de pagina (mprotect) + SIGSEGV. Captura el PC del que escribe
+// (via REG_RIP) sin tocar el header generado (no recompila los 18k .cpp).
+// El objetivo es responder "quien escribe 0xC80000+" (lead del HANDOFF).
+// Tras el primer fault de una pagina se la deja RW (no se re-protege), asi
+// que se registra un escritor por pagina; suficiente para enumerar rutinas.
+#if defined(__linux__)
+namespace
+{
+    uint8_t *g_wpLo = nullptr;
+    uint8_t *g_wpHi = nullptr;
+    uintptr_t g_wpBinBase = 0;
+    uintptr_t g_wpTextLo = 0;
+    uintptr_t g_wpTextHi = 0;
+    constexpr int kMaxChains = 64;
+    struct WpSig
+    {
+        uintptr_t sig;
+        uintptr_t minAddr;
+        uintptr_t maxAddr;
+        uint64_t hits;
+    };
+    WpSig g_wpSigs[kMaxChains];
+    int g_wpSigCount = 0;
+    uint64_t g_wpFaults = 0;
+
+    void wpFindRanges()
+    {
+        FILE *f = std::fopen("/proc/self/maps", "r");
+        if (f == nullptr)
+            return;
+        char line[512];
+        uintptr_t best = ~static_cast<uintptr_t>(0);
+        while (std::fgets(line, sizeof(line), f) != nullptr)
+        {
+            if (std::strstr(line, "sword_etheria") == nullptr)
+                continue;
+            const char *dash = std::strchr(line, '-');
+            if (dash == nullptr)
+                continue;
+            const uintptr_t a = static_cast<uintptr_t>(std::strtoull(line, nullptr, 16));
+            const uintptr_t b = static_cast<uintptr_t>(std::strtoull(dash + 1, nullptr, 16));
+            if (a < best)
+                best = a;
+            if (std::strstr(line, "r-x") != nullptr)
+            {
+                if (g_wpTextLo == 0u || a < g_wpTextLo)
+                    g_wpTextLo = a;
+                if (b > g_wpTextHi)
+                    g_wpTextHi = b;
+            }
+        }
+        std::fclose(f);
+        g_wpBinBase = (best == ~static_cast<uintptr_t>(0)) ? 0u : best;
+    }
+
+    void wpAppendHex(char *buf, int &n, uintptr_t v)
+    {
+        char d[16];
+        int k = 0;
+        if (v == 0)
+            d[k++] = '0';
+        while (v != 0)
+        {
+            d[k++] = "0123456789abcdef"[v & 0xFu];
+            v >>= 4;
+        }
+        buf[n++] = '0';
+        buf[n++] = 'x';
+        while (k > 0)
+            buf[n++] = d[--k];
+    }
+
+    void wpRecord(uintptr_t sig, uintptr_t rip, uintptr_t addr, const uintptr_t *chain, int nc)
+    {
+        WpSig *slot = nullptr;
+        for (int i = 0; i < g_wpSigCount; ++i)
+        {
+            if (g_wpSigs[i].sig == sig)
+            {
+                slot = &g_wpSigs[i];
+                break;
+            }
+        }
+        if (slot != nullptr)
+        {
+            if (addr < slot->minAddr)
+                slot->minAddr = addr;
+            if (addr > slot->maxAddr)
+                slot->maxAddr = addr;
+            slot->hits++;
+            return;
+        }
+
+        const int idx = (g_wpSigCount < kMaxChains) ? g_wpSigCount++ : (kMaxChains - 1);
+        g_wpSigs[idx].sig = sig;
+        g_wpSigs[idx].minAddr = addr;
+        g_wpSigs[idx].maxAddr = addr;
+        g_wpSigs[idx].hits = 1;
+
+        char buf[384];
+        int n = 0;
+        auto app = [&](const char *s) { while (*s != '\0') buf[n++] = *s++; };
+        app("[wp-sig] sig_off=");
+        wpAppendHex(buf, n, (g_wpBinBase != 0u) ? (sig - g_wpBinBase) : sig);
+        app(" rip_off=");
+        wpAppendHex(buf, n, (g_wpBinBase != 0u) ? (rip - g_wpBinBase) : rip);
+        app(" addr=");
+        wpAppendHex(buf, n, addr);
+        for (int i = 0; i < nc; ++i)
+        {
+            app(" f");
+            buf[n++] = static_cast<char>('0' + (i % 10));
+            buf[n++] = '=';
+            wpAppendHex(buf, n, (g_wpBinBase != 0u) ? (chain[i] - g_wpBinBase) : chain[i]);
+        }
+        buf[n++] = '\n';
+        const ssize_t w = ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+        (void)w;
+    }
+
+    void wpHandleSegv(int /*sig*/, siginfo_t *si, void *uc)
+    {
+        auto *u = static_cast<ucontext_t *>(uc);
+        const uintptr_t rip = static_cast<uintptr_t>(u->uc_mcontext.gregs[REG_RIP]);
+        const uintptr_t rsp = static_cast<uintptr_t>(u->uc_mcontext.gregs[REG_RSP]);
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(si->si_addr);
+
+        if (g_wpLo == nullptr || addr < reinterpret_cast<uintptr_t>(g_wpLo) ||
+            addr >= reinterpret_cast<uintptr_t>(g_wpHi))
+        {
+            ::signal(SIGSEGV, SIG_DFL);
+            ::raise(SIGSEGV);
+            return;
+        }
+
+        uintptr_t chain[8];
+        int nc = 0;
+        for (int i = 0; i < 256 && nc < 8; ++i)
+        {
+            uintptr_t v = 0u;
+            std::memcpy(&v, reinterpret_cast<const void *>(rsp + static_cast<uintptr_t>(i) * 8u), sizeof(v));
+            if (g_wpTextLo != 0u && v > g_wpTextLo && v < g_wpTextHi)
+                chain[nc++] = v;
+        }
+        const uintptr_t sig = (nc > 0) ? chain[0] : rip;
+        wpRecord(sig, rip, addr, chain, nc);
+
+        const uintptr_t page = addr & ~static_cast<uintptr_t>(0xFFFu);
+        // Cada 32 faults se re-arma toda la region RO para seguir muestreando
+        // escritores (asi no queda "solo el primero por pagina").
+        if ((g_wpFaults++ % 32ull) == 0ull && g_wpLo != nullptr)
+            ::mprotect(g_wpLo, static_cast<size_t>(g_wpHi - g_wpLo), PROT_READ);
+        ::mprotect(reinterpret_cast<void *>(page), 0x1000u, PROT_READ | PROT_WRITE);
+    }
+
+    void wpInstall(uint8_t *rdram, uint32_t lo, uint32_t hi)
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(rdram);
+        const uintptr_t plo = (base + lo + 0xFFFu) & ~static_cast<uintptr_t>(0xFFFu);
+        const uintptr_t phi = (base + hi) & ~static_cast<uintptr_t>(0xFFFu);
+        if (phi <= plo)
+        {
+            std::fprintf(stderr, "[wp-writer] rango invalido\n");
+            return;
+        }
+        g_wpLo = reinterpret_cast<uint8_t *>(plo);
+        g_wpHi = reinterpret_cast<uint8_t *>(phi);
+        wpFindRanges();
+
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = wpHandleSegv;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        if (::sigaction(SIGSEGV, &sa, nullptr) != 0)
+        {
+            std::fprintf(stderr, "[wp-writer] sigaction fallo errno=%d\n", errno);
+            return;
+        }
+        if (::mprotect(reinterpret_cast<void *>(plo), phi - plo, PROT_READ) != 0)
+        {
+            std::fprintf(stderr, "[wp-writer] mprotect fallo errno=%d\n", errno);
+            return;
+        }
+        std::fprintf(stderr, "[wp-writer] activo rdram=%p base=0x%llx text=[0x%llx,0x%llx) watch=[0x%llx,0x%llx) pages=%zu\n",
+                     reinterpret_cast<void *>(rdram),
+                     static_cast<unsigned long long>(g_wpBinBase),
+                     static_cast<unsigned long long>(g_wpTextLo),
+                     static_cast<unsigned long long>(g_wpTextHi),
+                     static_cast<unsigned long long>(plo),
+                     static_cast<unsigned long long>(phi),
+                     static_cast<size_t>((phi - plo) / 0x1000u));
+        std::fflush(stderr);
+    }
+}
+#endif
 
 namespace
 {
@@ -338,6 +546,11 @@ bool PS2Memory::initialize(size_t ramSize)
         // Allocate main RAM
         m_rdram = new uint8_t[ramSize];
         std::memset(m_rdram, 0, ramSize);
+#if defined(__linux__)
+        // SWORD_WP_WRITER=1: hook de escritores a 0xC80000-0xE50000 (lead HANDOFF).
+        if (std::getenv("SWORD_WP_WRITER") != nullptr)
+            wpInstall(m_rdram, 0x00C80000u, 0x00E50000u);
+#endif
 
         // Allocate scratchpad
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
@@ -359,8 +572,9 @@ bool PS2Memory::initialize(size_t ramSize)
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
         // memset zero-fills std::atomic<uint64_t>::csr's bytes, which is not itself
-        // a guaranteed-valid atomic store; make the zero-initialization explicit.
-        gs_regs.csr.store(0);
+        // a guaranteed-valid atomic store; make the initialization explicit.
+        // Bit 14 = FIFO empty (01b), REV=0x20, ID=0x50.
+        gs_regs.csr.store(0x50204000ull);
         gs_regs.dispfb1 = (0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43);
         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
         gs_regs.dispfb2 = gs_regs.dispfb1;
@@ -748,7 +962,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            uint64_t val = gs_regs.csr.load();
+            uint64_t val = (gs_regs.csr.load() & ~0x8000ull) | 0x50204000ull;
             return (uint32_t)(val >> (off * 8));
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -795,7 +1009,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return gs_regs.csr.load();
+            return (gs_regs.csr.load() & ~0x8000ull) | 0x50204000ull;
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
         return reg ? *reg : 0;
@@ -1305,6 +1519,31 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            // TRIAGE 2026-10-08: histograma por canal DMAC — ¿el juego manda
+            // datos de render (VIF1=0x9, GIF=0xA) o solo periféricos?
+            {
+                static uint64_t s_chan[16] = {0};
+                static uint64_t s_dmaN = 0;
+                s_chan[(channelBase >> 12) & 0xFu]++;
+                if ((++s_dmaN % 1000u) == 0u) {
+                    std::cout << "[dma:chans] total=" << s_dmaN;
+                    for (uint32_t ci = 0; ci < 16u; ++ci) {
+                        if (s_chan[ci]) std::cout << " ch" << ci << "=" << s_chan[ci];
+                    }
+                    std::cout << std::endl;
+                }
+            }
+            static uint32_t s_dmaChanLogCount = 0;
+            if (s_dmaChanLogCount < 20 || (s_dmaChanLogCount % 500) == 0)
+            {
+                std::cout << "[dma:start] #" << s_dmaChanLogCount
+                          << " chan=0x" << std::hex << channelBase
+                          << " madr=0x" << madr
+                          << " qwc=" << std::dec << qwc
+                          << " chcr=0x" << std::hex << value
+                          << std::dec << std::endl;
+            }
+            s_dmaChanLogCount++;
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -1317,6 +1556,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 {
                     if (qwCount == 0)
                         return;
+                    if (channelBase == 0x10009000u)
+                    {
+                        static int s_vif1direct = 0;
+                        if (s_vif1direct < 60)
+                        {
+                            uint32_t first = 0u;
+                            try
+                            {
+                                const uint32_t pp = translateAddress(srcAddr);
+                                if (pp + 4u <= PS2_RAM_SIZE)
+                                    std::memcpy(&first, m_rdram + pp, 4);
+                            }
+                            catch (const std::exception &) {}
+                            std::cout << "[vif1-direct] #" << s_vif1direct << " src=0x" << std::hex << srcAddr
+                                      << " qw=" << std::dec << qwCount << " first=0x" << std::hex << first
+                                      << std::dec << std::endl;
+                            ++s_vif1direct;
+                        }
+                    }
                     const bool scratch = isScratchpad(srcAddr);
                     PendingTransfer pt;
                     pt.fromScratchpad = scratch;
@@ -1349,6 +1607,27 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
+                        if (channelBase == 0x10009000u && qwCount > 0u)
+                        {
+                            static int s_vif1chain = 0;
+                            if (s_vif1chain < 60)
+                            {
+                                uint32_t words[16] = {0u};
+                                try
+                                {
+                                    const uint32_t pp = translateAddress(srcAddr);
+                                    if (pp + 64u <= PS2_RAM_SIZE)
+                                        std::memcpy(words, m_rdram + pp, 64u);
+                                }
+                                catch (const std::exception &) {}
+                                std::cout << "[vif1-chain] #" << s_vif1chain << " src=0x" << std::hex << srcAddr
+                                          << " qw=" << std::dec << qwCount << " data=" << std::hex;
+                                for (int wi = 0; wi < 16; ++wi)
+                                    std::cout << words[wi] << " ";
+                                std::cout << std::dec << std::endl;
+                                ++s_vif1chain;
+                            }
+                        }
                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
                         const bool scratch = isScratchpad(srcAddr);
@@ -1919,9 +2198,9 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
     return causes;
 }
 
-void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+void PS2Memory::flushMaskedPath3Packets(bool drainImmediately, bool force)
 {
-    if (m_path3Masked || m_path3MaskedFifo.empty())
+    if ((m_path3Masked && !force) || m_path3MaskedFifo.empty())
         return;
 
     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
@@ -2308,7 +2587,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
+            uint64_t val = (gs_regs.csr.load() & ~0x8000ull) | 0x50204000ull;
+            return static_cast<uint32_t>((val >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -2383,6 +2663,19 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 return 0xF0000002;
             }
             return 0;
+        }
+
+        // 2026-10-09: registro de hardware usado por `FUN_004d3730`/`entry_004d3770`
+        // (poll del **bit 2** = "done") y por `FUN_00874f10` (exige el **bit 12** en 0).
+        // Sin modelo, el poll de entrada 0x4d3770 gira infinito. 0x4 satisface a ambos.
+        // Env `SWORD_FIX_4D3740`: `=0` desactiva el modelo (A/B).
+        if (address == 0x1000F000u)
+        {
+            static const bool s_model = []() {
+                const char *e = std::getenv("SWORD_FIX_4D3740");
+                return e != nullptr && *e != '0';
+            }();
+            return s_model ? 0x4u : 0u;
         }
     }
 

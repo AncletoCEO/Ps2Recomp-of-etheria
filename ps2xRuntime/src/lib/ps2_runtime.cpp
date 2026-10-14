@@ -15,6 +15,8 @@
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
@@ -682,6 +684,24 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     // TRIAGE 2026-10-08: ¿el juego corre VU1?
+                                     // ¿y DESDE DÓNDE (pc/ra del EE)?
+                                     {
+                                         static uint64_t s_mscal = 0;
+                                         ++s_mscal;
+                                         if (s_mscal <= 60ull || (s_mscal % 500ull) == 0ull) {
+                                             const uint32_t eePc = cpuContext->pc;
+                                             const uint32_t eeRa = static_cast<uint32_t>(_mm_cvtsi128_si32(cpuContext->r[31]));
+                                             RUNTIME_LOG("[vu1:mscal] n=" << s_mscal
+                                                         << " startPc=0x" << std::hex << startPC << std::dec
+                                                         << " endPc=0x" << std::hex << m_vu1.state().pc << std::dec
+                                                         << " cycles=" << m_vu1.state().cycles
+                                                         << " stopD=" << (m_vu1.state().stoppedByD ? 1 : 0)
+                                                         << " stopT=" << (m_vu1.state().stoppedByT ? 1 : 0)
+                                                         << " eePc=0x" << std::hex << eePc
+                                                         << " eeRa=0x" << eeRa << std::dec);
+                                         }
+                                     }
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -700,6 +720,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     {
+                                         static uint64_t s_mscnt = 0;
+                                         ++s_mscnt;
+                                         if (s_mscnt <= 10ull || (s_mscnt % 500ull) == 0ull) {
+                                             RUNTIME_LOG("[vu1:mscnt] n=" << s_mscnt
+                                                         << " endPc=0x" << std::hex << m_vu1.state().pc << std::dec
+                                                         << " cycles=" << m_vu1.state().cycles
+                                                         << " stopD=" << (m_vu1.state().stoppedByD ? 1 : 0)
+                                                         << " stopT=" << (m_vu1.state().stoppedByT ? 1 : 0));
+                                         }
+                                     }
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -1273,7 +1304,9 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         readGuestU32Offset(a0Word0, 0x08u, vtableSlot8) &&
         readGuestU32Offset(a0Word0, 0x0cu, vtableSlotC);
 
-    if (firstReport)
+    static std::atomic<uint32_t> s_missLog{0};
+    const bool logThisMiss = s_missLog.fetch_add(1, std::memory_order_relaxed) < 200u;
+    if (firstReport || logThisMiss)
     {
         std::ostringstream oss;
         oss << "[guest-branch:missing-target] kind=" << describeGuestBranchKind(kind)
@@ -1352,6 +1385,54 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+
+    // 2026-10-09: TRACE de control de flujo (acelerador de diagnóstico). Env
+    // SWORD_TRACE_BRANCH="<start>-<end>" (hex). Loguea cada transferencia cuyo
+    // target o source caiga en el rango, a /tmp/sword_branch.log. Es la ÚNICA forma
+    // de ver el flujo DENTRO de la mega-función 0x4eb8d0..0x6cba48 (donde
+    // replaceFunction no aplica porque el barrido reemplaza los slots).
+    {
+        struct TraceCfg
+        {
+            bool on = false;
+            uint32_t lo = 0u;
+            uint32_t hi = 0u;
+        };
+        static const TraceCfg s_trace = []() {
+            TraceCfg c;
+            const char *e = std::getenv("SWORD_TRACE_BRANCH");
+            if (e == nullptr || *e == '\0')
+                return c;
+            unsigned long a = 0ul, b = 0ul;
+            if (std::sscanf(e, "%lx-%lx", &a, &b) == 2 && b > a)
+            {
+                c.on = true;
+                c.lo = static_cast<uint32_t>(a);
+                c.hi = static_cast<uint32_t>(b);
+            }
+            return c;
+        }();
+        if (s_trace.on &&
+            ((targetPc >= s_trace.lo && targetPc < s_trace.hi) ||
+             (sourcePc >= s_trace.lo && sourcePc < s_trace.hi)))
+        {
+            static std::ofstream s_out("/tmp/sword_branch.log", std::ios::out | std::ios::trunc);
+            static uint64_t s_n = 0;
+            if (s_n < 3000000ull)
+            {
+                ++s_n;
+                // 2026-10-10 (§8.2 del HANDOFF): incluir a0/a1 en el trace para nombrar
+                // el semáforo (a0 = sema id en WaitSema/SignalSema) y ver ambos hilos a
+                // la vez sin depender del [triage-sema] (rate-limitado).
+                const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                s_out << "tid=" << (m_eeScheduler ? m_eeScheduler->currentThreadId() : 0)
+                      << " src=0x" << std::hex << sourcePc << " tgt=0x" << targetPc
+                      << " kind=" << static_cast<int>(kind)
+                      << " a0=0x" << a0 << " a1=0x" << a1 << std::dec << "\n";
+            }
+        }
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -1487,6 +1568,224 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
     {
+        // TRIAGE 2026-10-08: estado de la cola de DMA del motor JUSTO cuando se
+        // despacha su handler (el handler sale si head==tail o f5cf!=0).
+        {
+            static uint64_t s_dmaIrq = 0;
+            ++s_dmaIrq;
+            if (s_dmaIrq <= 40ull || (s_dmaIrq % 500ull) == 0ull)
+            {
+                R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                const uint32_t gp = c ? static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) : 0x00A28070u;
+                auto rd32 = [&](uint32_t addr) -> uint32_t {
+                    uint32_t v = 0;
+                    const uint32_t p = addr & 0x01FFFFFFu;
+                    if (p + 4u <= 0x02000000u) std::memcpy(&v, rdram + p, 4);
+                    return v;
+                };
+                auto rd8 = [&](uint32_t addr) -> uint32_t {
+                    const uint32_t p = addr & 0x01FFFFFFu;
+                    return (p < 0x02000000u) ? rdram[p] : 0u;
+                };
+                const uint32_t head = rd32(gp + 0x638u);
+                const uint32_t tail = rd32(gp + 0x63Cu);
+                const uint32_t cb = rd32(gp - 0x7A30u);
+                RUNTIME_LOG("[dmairq] n=" << s_dmaIrq << " cause=" << cause
+                            << " gp=0x" << std::hex << gp
+                            << " head=0x" << head << " tail=0x" << tail << std::dec
+                            << (head == tail ? " EMPTY" : " WORK")
+                            << " f630=" << rd8(gp + 0x630u)
+                            << " f5cf=" << rd8(gp + 0x5CFu)
+                            << " cb=0x" << std::hex << cb << std::dec);
+            }
+        }
+        // ATAJO 2026-10-08: el reset del motor deja f5cf=0, pero algo lo vuelve a
+        // 1 despues (escritores 0x6e44e4/44fc/4644, dentro del handler de DMAC),
+        // y el handler sale por 0x6e40fc (bne f5cf,0 -> epilogo). Forzamos f5cf=0
+        // antes de despachar para ver si el pipeline arranca (SWORD_FORCE_F5CF=1).
+        static const bool s_forzarF5cfCero = []() {
+            const char *e = std::getenv("SWORD_FORCE_F5CF");
+            return e != nullptr && *e == '1';
+        }();
+        if (s_forzarF5cfCero)
+        {
+            R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            const uint32_t gp = c ? static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) : 0x00A28070u;
+            const uint32_t p = (gp + 0x5CFu) & 0x01FFFFFFu;
+            if (p < 0x02000000u && rdram[p] != 0u)
+            {
+                static uint64_t s_fz = 0;
+                if (++s_fz <= 10ull || (s_fz % 2000ull) == 0ull)
+                {
+                    RUNTIME_LOG("[f5cf-force] n=" << s_fz << " prev=" << static_cast<uint32_t>(rdram[p]));
+                }
+                rdram[p] = 0u;
+            }
+        }
+        // ATAJO 2026-10-08: el spin 0x6e4d98 llama a cb (gp-0x7A30) cuando head==tail
+        // para PRODUCIR; cb=0 => nunca llena. Experimento: instalar cb = 0x6e4348
+        // (el productor) para que el spin lo invoque (SWORD_CB_PRODUCER=1).
+        static const bool s_cbProducer = []() {
+            const char *e = std::getenv("SWORD_CB_PRODUCER");
+            return e != nullptr && *e == '1';
+        }();
+        if (s_cbProducer)
+        {
+            R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            const uint32_t gp = c ? static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) : 0x00A28070u;
+            const uint32_t pc = (gp - 0x7A30u) & 0x01FFFFFFu;
+            if (pc + 4u <= 0x02000000u)
+            {
+                uint32_t cur = 0;
+                std::memcpy(&cur, rdram + pc, 4);
+                if (cur == 0u)
+                {
+                    const uint32_t prod = 0x006e4348u;
+                    std::memcpy(rdram + pc, &prod, 4);
+                    static bool s_logged = false;
+                    if (!s_logged) { s_logged = true; RUNTIME_LOG("[cb-install] cb = 0x6e4348 (productor)"); }
+                }
+            }
+        }
+        // A/B 2026-10-09: volcar RDRAM en la PRIMERA asignacion del heap del juego
+        // (0xA43F18 pasa de 0 a !=0) para capturar el resultado de la INIT y
+        // compararlo 1:1 con el savestate 01 (count 0).
+        {
+            static bool s_earlyDumped = false;
+            uint32_t cnt = 0;
+            std::memcpy(&cnt, rdram + 0x00A43F18u, 4);
+            if (!s_earlyDumped && cnt != 0u)
+            {
+                s_earlyDumped = true;
+                RUNTIME_LOG("[heap] primera asignacion count=" << cnt);
+                if (const char *dumpPath = std::getenv("SWORD_RDRAM_DUMP_EARLY"))
+                {
+                    if (FILE *f = std::fopen(dumpPath, "wb"))
+                    {
+                        std::fwrite(rdram + 0x00870000u, 1u, 0x00230000u, f);
+                        std::fclose(f);
+                        RUNTIME_LOG("[heap] rdram dump temprano -> " << dumpPath);
+                    }
+                }
+                if (const char *dumpPath = std::getenv("SWORD_RDRAM_DUMP_FULL"))
+                {
+                    if (FILE *f = std::fopen(dumpPath, "wb"))
+                    {
+                        std::fwrite(rdram, 1u, PS2_RAM_SIZE, f);
+                        std::fclose(f);
+                        RUNTIME_LOG("[heap] rdram dump COMPLETO -> " << dumpPath);
+                    }
+                }
+            }
+        }
+        // A/B 2026-10-08: volcar el bloque del motor gp+0x5C0..0x650 la PRIMERA vez
+        // que head (gp+0x638) != 0 (i.e. post-init), para comparar 1:1 con PCSX2.
+        {
+            static bool s_dumped = false;
+            R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            const uint32_t gp = c ? static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) : 0x00A28070u;
+            uint32_t head = 0;
+            const uint32_t ha = (gp + 0x638u) & 0x01FFFFFFu;
+            if (ha + 4u <= 0x02000000u) std::memcpy(&head, rdram + ha, 4);
+            if (!s_dumped && head != 0u)
+            {
+                s_dumped = true;
+                RUNTIME_LOG("[motor] (primer head!=0) head=" << std::hex << head << std::dec);
+                // A/B 2026-10-08: volcar 512 KB de RDRAM (0x220000..0x2A0000) a un
+                // archivo para diffear contra el savestate de PCSX2.
+                if (const char *dumpPath = std::getenv("SWORD_RDRAM_DUMP"))
+                {
+                    if (FILE *f = std::fopen(dumpPath, "wb"))
+                    {
+                        std::fwrite(rdram + 0x00870000u, 1u, 0x00230000u, f);
+                        std::fclose(f);
+                        RUNTIME_LOG("[motor] rdram dump -> " << dumpPath);
+                    }
+                }
+                for (uint32_t off = 0x5C0u; off < 0x650u; off += 0x10u)
+                {
+                    char line[256];
+                    int n = std::snprintf(line, sizeof(line), "[motor] gp+%#05x:", off);
+                    for (int i = 0; i < 16; i += 4)
+                    {
+                        uint32_t v = 0;
+                        const uint32_t a = (gp + off + static_cast<uint32_t>(i)) & 0x01FFFFFFu;
+                        if (a + 4u <= 0x02000000u) std::memcpy(&v, rdram + a, 4);
+                        n += std::snprintf(line + n, sizeof(line) - n, " %08x", v);
+                    }
+                    RUNTIME_LOG(line);
+                }
+            }
+        }
+        // ATAJO 2026-10-08: el kick GIF (0x6e47e4) requiere *(v0+0x3C0)!=0 (CHCR).
+        // SWORD_FORCE_3C0=<val> lo fuerza antes del dispatch.
+        static const uint32_t s_force3c0 = []() -> uint32_t {
+            const char *e = std::getenv("SWORD_FORCE_3C0");
+            return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+        }();
+        if (s_force3c0 != 0u)
+        {
+            R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            const uint32_t gp = c ? static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28])) : 0x00A28070u;
+            const uint32_t a = (gp + 0x3C0u) & 0x01FFFFFFu;
+            if (a + 4u <= 0x02000000u) std::memcpy(rdram + a, &s_force3c0, 4);
+        }
+        // 4.9.4 (2026-10-08): contar contenido de VRAM por bloque (1 MB) para ver
+        // en que FBP renderiza el recomp (comparar con GS.bin del savestate).
+        {
+            static uint64_t s_gs = 0;
+            if (((++s_gs % 20ull) == 0ull) && m_boundGSVram != nullptr)
+            {
+                char line[256];
+                int n = std::snprintf(line, sizeof(line), "[gsblk]");
+                for (uint32_t b = 0; b < 4u; ++b)
+                {
+                    uint64_t rgb = 0;
+                    const uint8_t *p = m_boundGSVram + b * 0x100000u;
+                    for (uint32_t i = 0; i < 0x100000u; i += 4)
+                    {
+                        uint32_t px = 0;
+                        std::memcpy(&px, p + i, 4);
+                        if ((px & 0x00FFFFFFu) != 0u) ++rgb;
+                    }
+                    n += std::snprintf(line + n, sizeof(line) - n, " b%u=%llu", b, (unsigned long long)rgb);
+                }
+                RUNTIME_LOG(line);
+            }
+        }
+        // A/B de registros (2026-10-08): loguear pc/ra/sp/gp del thread activo para
+        // comparar con el real del savestate (pc=0x6E4CDC ra=0x7FE000 sp=0x1FFDBA0 gp=0xA28070).
+        {
+            static int s_regs = 0;
+            if (++s_regs <= 12)
+            {
+                R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                if (c != nullptr)
+                {
+                    RUNTIME_LOG("[regs] #" << s_regs
+                                << " pc=0x" << std::hex << c->pc
+                                << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[31]))
+                                << " sp=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[29]))
+                                << " gp=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(c->r[28]))
+                                << std::dec);
+                }
+            }
+        }
+        // Watchpoint 2026-10-08: detectar cambios de *(0xA988C0) (el puntero del
+        // allocator del motor) y loguear el pc que lo produce.
+        {
+            static uint32_t s_last = 0xFFFFFFFFu;
+            static int s_n = 0;
+            uint32_t v = 0;
+            std::memcpy(&v, rdram + 0x00A888C0u, 4);
+            if (v != s_last && ++s_n <= 15)
+            {
+                R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                RUNTIME_LOG("[wp-A988C0] #" << s_n << " v=0x" << std::hex << v
+                            << " pc=0x" << (c != nullptr ? c->pc : 0u) << std::dec);
+                s_last = v;
+            }
+        }
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
     }
 }
@@ -2078,9 +2377,75 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+// 2026-10-09 (a, Fase 1): watchpoint de "variable de fase de escena".
+// Loguea la PRIMERA escritura (valor pequeño <=0x40) por dirección en las
+// regiones de datos del juego (heap 0x5E0000..0xCC0000 y globals 0x870000..0x880000)
+// y hasta 100 cambios de valor posteriores. A/B: SWORD_SCENE_WP=0 lo apaga.
+static void swordSceneWatch(R5900Context *ctx, uint32_t vaddr, uint32_t value, int size)
+{
+    static const bool s_on = []() {
+        const char *e = std::getenv("SWORD_SCENE_WP");
+        return !(e != nullptr && *e == '0');
+    }();
+    if (!s_on || value > 0x40u) {
+        return;
+    }
+    const uint32_t a = vaddr & 0x01FFFFFFu;
+    const bool inRange = (a >= 0x005E0000u && a < 0x00CC0000u) || (a >= 0x00870000u && a < 0x00880000u);
+    if (!inRange) {
+        return;
+    }
+    static int s_work = 0;
+    if (++s_work > 200000) {
+        return;
+    }
+    static uint32_t s_addr[256];
+    static uint32_t s_val[256];
+    static int s_n = 0;
+    static int s_chg = 0;
+    const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+    for (int i = 0; i < s_n; ++i) {
+        if (s_addr[i] == a) {
+            if (s_val[i] != value && s_chg < 100) {
+                RUNTIME_LOG("[scene-chg] #" << ++s_chg << " addr=0x" << std::hex << vaddr
+                            << std::dec << " " << s_val[i] << "->" << value
+                            << " size=" << size << " pc=0x" << std::hex << ctx->pc
+                            << " ra=0x" << ra << std::dec);
+                s_val[i] = value;
+            }
+            return;
+        }
+    }
+    if (s_n < 256) {
+        s_addr[s_n] = a;
+        s_val[s_n] = value;
+        ++s_n;
+        RUNTIME_LOG("[scene-wp] #" << s_n << " addr=0x" << std::hex << vaddr
+                    << " val=" << std::dec << value << " size=" << size
+                    << " pc=0x" << std::hex << ctx->pc << " ra=0x" << ra << std::dec);
+    }
+}
+
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
+    swordSceneWatch(ctx, vaddr, static_cast<uint32_t>(value), 1);
+    // TRIAGE 2026-10-08: watchpoint en gp+0x5CF / gp+0x630 (flags del motor de DMA).
+    {
+        const uint32_t gp = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28])) & 0x01FFFFFFu;
+        if (vaddr == ((gp + 0x5CFu) & 0x01FFFFFFu) || vaddr == ((gp + 0x630u) & 0x01FFFFFFu))
+        {
+            static uint64_t s_w8 = 0;
+            ++s_w8;
+            if (s_w8 <= 40ull || (s_w8 % 200ull) == 0ull)
+            {
+                RUNTIME_LOG("[wp8] addr=0x" << std::hex << vaddr << " val=" << std::dec
+                            << static_cast<uint32_t>(value) << " pc=0x" << std::hex << ctx->pc
+                            << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                            << std::dec << " n=" << s_w8);
+            }
+        }
+    }
     try
     {
         m_memory.write8(vaddr, value);
@@ -2094,6 +2459,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
+    swordSceneWatch(ctx, vaddr, static_cast<uint32_t>(value), 2);
     try
     {
         m_memory.write16(vaddr, value);
@@ -2104,9 +2470,61 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
 }
 
+// 2026-10-10 DIAG render: último pc guest que hizo un Store (para atribuir los paquetes/prims GS).
+uint32_t g_lastStorePc = 0u;
+
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    g_lastStorePc = ctx ? ctx->pc : 0u;
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    swordSceneWatch(ctx, vaddr, value, 4);
+    // TRIAGE 2026-10-08: sitio REAL del kick DMA VIF1 (CHCR en 0x10009000,
+    // bit 8 = start) con el pc/ra del EE.
+    if (vaddr == 0x10009000u && (value & 0x100u) != 0u)
+    {
+        static uint64_t s_vif1Kick = 0;
+        ++s_vif1Kick;
+        if (s_vif1Kick <= 30ull || (s_vif1Kick % 500ull) == 0ull)
+        {
+            uint32_t madr = 0u, qwc = 0u;
+            try
+            {
+                madr = m_memory.read32(0x10009010u);
+                qwc = m_memory.read32(0x10009020u);
+            }
+            catch (const std::exception &)
+            {
+            }
+            RUNTIME_LOG("[dma:kick] VIF1 CHCR=0x" << std::hex << value
+                        << " madr=0x" << madr << " qwc=0x" << (qwc & 0xFFFFu)
+                        << " pc=0x" << ctx->pc
+                        << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                        << std::dec << " n=" << s_vif1Kick);
+        }
+    }
+    // TRIAGE 2026-10-08: watchpoint en gp+0x638/0x63C (head/tail) y gp-0x7A30 (cb).
+    // Se comparan AMBAS formas: relativa al gp del ctx y absoluta (gp=0xA28070).
+    {
+        const uint32_t gpRaw = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
+        const uint32_t gp = gpRaw & 0x01FFFFFFu;
+        const bool hit =
+            vaddr == ((gp + 0x638u) & 0x01FFFFFFu) || vaddr == ((gp + 0x63Cu) & 0x01FFFFFFu) ||
+            vaddr == ((gpRaw - 0x7A30u) & 0x01FFFFFFu) ||
+            vaddr == 0x00A286A8u || vaddr == 0x00A286ACu || vaddr == 0x00A20640u;
+        if (hit)
+        {
+            static uint64_t s_w32 = 0;
+            ++s_w32;
+            if (s_w32 <= 60ull || (s_w32 % 400ull) == 0ull)
+            {
+                RUNTIME_LOG("[wp32] addr=0x" << std::hex << vaddr << " val=0x" << value
+                            << " pc=0x" << ctx->pc
+                            << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                            << " gp=0x" << gpRaw
+                            << std::dec << " n=" << s_w32);
+            }
+        }
+    }
     try
     {
         m_memory.write32(vaddr, value);
@@ -2115,6 +2533,20 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     catch (const std::exception &)
     {
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+    }
+
+    // 2026-10-10 DIAG render: pc de las escrituras a registros GS (0x12000000) / GIF (0x10003000),
+    // para ubicar el código que dibuja los sprites del menú.
+    if ((vaddr >> 24) == 0x12u || (vaddr & 0xFFFFF000u) == 0x10003000u)
+    {
+        static uint64_t s_gsW = 0;
+        ++s_gsW;
+        if (s_gsW <= 300ull || (s_gsW % 2000ull) == 0ull)
+        {
+            RUNTIME_LOG("[gs:wpc] addr=0x" << std::hex << vaddr << " val=0x" << value
+                        << " pc=0x" << ctx->pc << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                        << std::dec << " n=" << s_gsW);
+        }
     }
 }
 
@@ -2133,6 +2565,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
 {
+    g_lastStorePc = ctx ? ctx->pc : 0u;
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
@@ -2265,6 +2698,12 @@ bool PS2Runtime::findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler
 
 void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, uint32_t handler)
 {
+    {
+        static int s_n = 0;
+        if (++s_n <= 40)
+            RUNTIME_LOG("[setsyscall] #" << s_n << " n=" << syscallNumber
+                        << " handler=0x" << std::hex << handler << std::dec);
+    }
     constexpr uint32_t kTableBase = 0x80011F80u & 0x1FFFFFFFu;
     constexpr uint32_t kMirrorLimit = 0x00080000u;
     const int64_t offset = static_cast<int64_t>(static_cast<int32_t>(syscallNumber)) * 4;
@@ -2416,10 +2855,31 @@ void PS2Runtime::run()
                                                << " gif=" << curGif
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
+                                               << " p3Mask=" << (m_memory.isPath3Masked() ? 1 : 0)
+                                               << " p3Fifo=" << m_memory.path3MaskedFifoSize()
                                                << std::endl);
 
             }
         });
+        if (m_memory.path3MaskedFifoSize() > 0)
+        {
+            m_memory.flushMaskedPath3Packets(true, true);
+        }
+        // A/B 2026-10-10: dump TARDIO (fase avanzada) para comparar con savestates del real.
+        if (const char *latePath = std::getenv("SWORD_RDRAM_DUMP_LATE"))
+        {
+            static bool s_lateDone = false;
+            if (!s_lateDone && tick >= 1200ull && m_memory.getRDRAM())
+            {
+                s_lateDone = true;
+                if (FILE *f = std::fopen(latePath, "wb"))
+                {
+                    std::fwrite(m_memory.getRDRAM(), 1u, PS2_RAM_SIZE, f);
+                    std::fclose(f);
+                    RUNTIME_LOG("[late] rdram dump -> " << latePath);
+                }
+            }
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2445,6 +2905,35 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        static uint64_t s_screenshotFrame = 0;
+        s_screenshotFrame++;
+        const char *ssDir = std::getenv("PS2_SCREENSHOT_DIR");
+        if (ssDir && *ssDir)
+        {
+            const char *intervalEnv = std::getenv("PS2_SCREENSHOT_INTERVAL");
+            uint64_t interval = intervalEnv ? std::strtoull(intervalEnv, nullptr, 10) : 0;
+            bool shouldCapture = false;
+            if (interval > 0)
+            {
+                shouldCapture = (s_screenshotFrame % interval) == 0;
+            }
+            else
+            {
+                shouldCapture = (s_screenshotFrame == 10 || s_screenshotFrame == 60 ||
+                                 s_screenshotFrame == 180 || s_screenshotFrame == 360 ||
+                                 s_screenshotFrame == 600 || s_screenshotFrame == 900 ||
+                                 s_screenshotFrame == 1200 || s_screenshotFrame == 1500 ||
+                                 s_screenshotFrame == 2000);
+            }
+            if (shouldCapture)
+            {
+                char ssPath[512];
+                std::snprintf(ssPath, sizeof(ssPath), "%s/frame_%04llu.png", ssDir, static_cast<unsigned long long>(s_screenshotFrame));
+                TakeScreenshot(ssPath);
+                std::cout << "[screenshot] saved " << ssPath << std::endl;
+            }
+        }
 
         if (WindowShouldClose())
         {

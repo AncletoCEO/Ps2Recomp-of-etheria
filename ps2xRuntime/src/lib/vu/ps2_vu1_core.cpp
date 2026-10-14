@@ -654,6 +654,19 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    // 2026-10-10 DIAG: stores de la VU1 hacia la zona del vertex de salida (~0xc00).
+    if (address >= 0x800u && address < 0x1400u)
+    {
+        static int s_qs = 0;
+        if (s_qs < 240)
+        {
+            ++s_qs;
+            std::cerr << "[VU1-store] #" << s_qs << " pc=0x" << std::hex << m_state.pc
+                      << " addr=0x" << address << " lane=0x" << static_cast<unsigned>(laneMask)
+                      << " w=" << words[0] << " " << words[1] << " " << words[2] << " " << words[3]
+                      << std::dec << std::endl;
+        }
+    }
     for (PendingStore &store : m_storePipeline)
     {
         if (!store.valid)
@@ -918,6 +931,28 @@ void VU1Interpreter::finishXgkick()
 {
     if (!m_xgkick.active)
         return;
+    {
+        static int s_xgf = 0;
+        if (++s_xgf <= 20)
+        {
+            uint64_t tagLo = 0;
+            if (m_xgkick.totalBytes >= 8u) std::memcpy(&tagLo, m_xgkick.packet.data(), 8);
+            std::cerr << "[XGKICK-fin] totalBytes=" << m_xgkick.totalBytes
+                      << " tag=0x" << std::hex << tagLo
+                      << " src=0x" << m_xgkick.sourceAddress
+                      << " raw=";
+            const uint32_t qAvail = m_xgkick.totalBytes / 16u;
+            const uint32_t qLimit = (qAvail < 16u) ? qAvail : 16u;
+            for (uint32_t qi = 0; qi < qLimit; ++qi)
+            {
+                uint64_t lo = 0, hi = 0;
+                std::memcpy(&lo, m_xgkick.packet.data() + qi * 16u, 8);
+                std::memcpy(&hi, m_xgkick.packet.data() + qi * 16u + 8u, 8);
+                std::cerr << ((qi == 0) ? "" : " | ") << lo << ":" << hi;
+            }
+            std::cerr << std::dec << " n=" << s_xgf << std::endl;
+        }
+    }
 
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -928,6 +963,11 @@ void VU1Interpreter::finishXgkick()
 
 void VU1Interpreter::startXgkick(uint32_t qwordAddress)
 {
+    {
+        static int s_xg = 0;
+        if (++s_xg <= 20)
+            std::cerr << "[XGKICK] start qw=0x" << std::hex << qwordAddress << std::dec << " n=" << s_xg << std::endl;
+    }
     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
         return;
 
@@ -1629,6 +1669,25 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
+    // 2026-10-10 DIAG: dump de la micro-memoria (código) y data de la VU1 para desensamblar.
+    {
+        static bool s_dumped = false;
+        if (!s_dumped && std::getenv("SWORD_DUMP_VU1CODE") != nullptr)
+        {
+            s_dumped = true;
+            if (FILE *f = std::fopen("/tmp/recomp_vu1code.bin", "wb"))
+            {
+                std::fwrite(vuCode, 1, codeSize, f);
+                std::fclose(f);
+            }
+            if (FILE *f = std::fopen("/tmp/recomp_vu1data.bin", "wb"))
+            {
+                std::fwrite(vuData, 1, dataSize, f);
+                std::fclose(f);
+            }
+        }
+    }
+
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
@@ -1640,6 +1699,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        // 2026-10-10 DIAG: trace por instrucción (pc + L + U) para desensamblar el microcódigo.
+        {
+            static int s_tr = 0;
+            if (s_tr < 900)
+            {
+                ++s_tr;
+                std::cerr << "[VU1-trace] pc=0x" << std::hex << m_state.pc
+                          << " L=0x" << decoded.lower << " U=0x" << decoded.upper
+                          << std::dec << std::endl;
+            }
+        }
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
