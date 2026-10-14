@@ -11,6 +11,14 @@ endif()
 
 project(PS2RetroX)
 
+# 2026-10-14: el runtime usa intrinsics SSE4.1 (_mm_extract_epi32/64, etc.) via
+# <immintrin.h>. GCC en x86-64 generico no las habilita por defecto y el build
+# fallaba con "target specific option mismatch". Se habilitan explicitamente.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i686|i386" AND
+   CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-msse4.1)
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
