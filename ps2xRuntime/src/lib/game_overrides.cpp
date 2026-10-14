@@ -617,8 +617,10 @@ namespace ps2_game_overrides
 // TRIAGE correlación 2026-10-05 (external linkage en el namespace que ve
 // iop_emulator.cpp): flag para loguear llamadas libsd DURANTE transfers
 // 0x30000. Se setea en pre y se limpia en post (ver rama híbrida abajo).
+// 2026-10-14: la DEFINICION se movio a ps2xIOP/.../iop_emulator.cpp (evita el
+// LNK2001 en Windows); aca solo se declara.
 namespace ps2x { namespace iop { namespace detail {
-bool g_tyosdTransferActive = false;
+extern bool g_tyosdTransferActive;
 } } }
 
 namespace

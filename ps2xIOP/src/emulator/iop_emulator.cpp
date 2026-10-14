@@ -29,6 +29,11 @@
 
 namespace ps2x::iop::detail
 {
+    // 2026-10-14: definicion AQUI (donde se consume). Antes vivia en
+    // game_overrides.cpp y en Windows el ejecutable que linkea ps2_iop.lib no
+    // incluia ese objeto -> LNK2001 unresolved external symbol.
+    bool g_tyosdTransferActive = false;
+
     namespace
     {
         constexpr uint32_t kRamSize = IopMemory::RamSize;

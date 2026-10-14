@@ -1328,8 +1328,10 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     if (isIoRegister(physAddr))
     {
         // Non-RAM 128-bit stores are modeled as two 64-bit stores.
-        uint64_t lo = _mm_extract_epi64(value, 0);
-        uint64_t hi = _mm_extract_epi64(value, 1);
+        // (SSE2 puro: _mm_extract_epi64 es SSE4.1 y requiere -msse4.1,
+        //  que el target no habilita -> fallaba en GCC 13 del CI.)
+        uint64_t lo = static_cast<uint64_t>(_mm_cvtsi128_si64(value));
+        uint64_t hi = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_unpackhi_epi64(value, value)));
 
         write64(address, lo);
         write64(address + 8, hi);
