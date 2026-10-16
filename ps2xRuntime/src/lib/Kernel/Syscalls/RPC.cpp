@@ -627,6 +627,24 @@ namespace ps2_syscalls
                 {
                     rpcZeroRdram(rdram, receiveBuffer, receiveSize);
                     zeroedFallback = true;
+                    // FIX 2026-10-16 (loader del hilo 3, FUN_00628640 Estado 1/2):
+                    // el cliente de streaming del juego llama a sceSifCallRpc con
+                    // recv = 0x00A46940 y su end_func (FUN_00628610, 0x628618) SOLO escribe
+                    // gp+0x5C = 1 si [0x00A46940] == 1:
+                    //   0x628618: lw  $a0, 0x6940($at)
+                    //   0x62861c: bne $a0, 1, skip
+                    //   0x628624: sw  $v1, 0x5C($gp)
+                    // Como el sid de ese cliente no esta en el HLE, esta rama ZEROEABA el
+                    // buffer => el callback omitia su sw y el hilo 3 giraba para siempre en
+                    // el Estado 2 (y el delay slot 0x62873c limpia gp+0x5C en cada pasada,
+                    // por eso forzarlo desde el VBlank no servia). Sembramos 1 aqui, ANTES
+                    // de despachar el callback (mas abajo, ~684), para que el propio codigo
+                    // NATIVO del juego levante el flag por su camino legitimo.
+                    if ((receiveBuffer & 0x01FFFFFFu) == 0x00A46940u && receiveSize >= 4u)
+                    {
+                        const uint32_t one = 1u;
+                        std::memcpy(rdram + (0x00A46940u & 0x01FFFFFFu), &one, sizeof(one));
+                    }
                 }
             }
 

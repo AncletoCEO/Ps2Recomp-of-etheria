@@ -64,7 +64,20 @@ namespace
             }
             oss << "}";
             {
-                // 2026-10-10 fix: estado del gate de carga (gp=0xA28070): +0x50 (hilo a despertar),
+                // 2026-10-16: lectura directa de $s7+0x118. En FUN_0074a308 el $s7 es la
+            // estructura estatica de BSS 0x00A887B8, asi que 0x118($s7) es la direccion
+            // ABSOLUTA 0x00A888D0. Ese slot es el callback que el bucle de polling usa
+            // (jalr $v0). Lo puebla el setter FUN_007fe9d0 (sw $a1, 0x118($a0)). Si esta en
+            // 0, el juego gira esperando que alguien lo escriba. Solo lee RDRAM.
+            {
+                uint32_t slot118 = 0u, slot110 = 0u, slot114 = 0u;
+                std::memcpy(&slot118, rdram + ((0x00A888D0u) & 0x01FFFFFFu), sizeof(slot118));
+                std::memcpy(&slot110, rdram + ((0x00A888C8u) & 0x01FFFFFFu), sizeof(slot110));
+                std::memcpy(&slot114, rdram + ((0x00A888CCu) & 0x01FFFFFFu), sizeof(slot114));
+                oss << " s7_118=0x" << std::hex << slot118
+                    << " s7_110=0x" << slot110 << " s7_114=0x" << slot114 << std::dec;
+            }
+            // 2026-10-10 fix: estado del gate de carga (gp=0xA28070): +0x50 (hilo a despertar),
                 // +0x54 (precondición del setter) y +0x58 (flag de carga completa que espera el loader).
                 const uint32_t gp = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
                 auto rd = [&](uint32_t off) -> uint32_t {
@@ -246,6 +259,16 @@ namespace
         // el recomp nunca lo hace → el loader duerme y no carga los `ptn_*`.
         // TRIAGE: setear el flag + despertar el hilo. Env SWORD_FORCE_LOADER=1.
         if (std::getenv("SWORD_FORCE_LOADER") != nullptr) {
+            // 2026-10-16 (v52): el hilo 3 tiene un SEGUNDO gate. Estado 2 de FUN_00628640
+            // (0x628798): `lw $v1,0x5C($gp); bne $v1,1` => gp+0x5C debe valer 1. Lo escribe
+            // el end_func del RPC a cdvdfsv (FUN_00628610, 0x628624: `sw $v1,0x5C($gp)`) y
+            // SOLO si [0x00A46940]==1 (0x628618: `lw $a0,0x6940($at); bne $a0,1`). El HLE de
+            // RPC no dispara ese callback, asi que lo forzamos para poder probar el resto.
+            {
+                const uint32_t one = 1u;
+                std::memcpy(rdram + ((0x00A280CCu) & 0x01FFFFFFu), &one, 4); // gp+0x5C = 1
+                std::memcpy(rdram + ((0x00A46940u) & 0x01FFFFFFu), &one, 4); // recvBuffer[0] = 1
+            }
             const uint32_t one = 1u;
             std::memcpy(rdram + (0x00A280C8u & 0x01FFFFFFu), &one, 4);
             (void)runtime->eeScheduler().wakeupThread(3, true);
@@ -1657,6 +1680,27 @@ namespace
             // retornar y el scheduler lo corre natural (con sus yields).
             if (!runtime->dispatchGuestBranch(rdram, ctx, 0x51FEA0u, 0x4C0208u, 0x4C0210u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
                 RUNTIME_LOG("[game_overrides] CRT0: 51FEA0 deferred to scheduler");
+                // FIX 2026-10-16 (hilo 1 parqueado en pc=0): en el camino de defer, la
+                // llamada NO se ejecuta y el scheduler vuelve al contexto base del hilo,
+                // que tiene pc=0, y lo manda a dormir (makeDormant -> st=5). Fijamos pc/ra
+                // en el contexto BASE para que el resume lo tome.
+                //
+                // OJO (validado con Gemini v47): aca NO hay que copiar *ctx ni purgar
+                // invocations. Si el ctx pertenece a una invocacion de kernel, traeria su
+                // stack temporal ($sp) y su $gp (rompiendo el del juego), y purgar la pila
+                // destruiria callbacks RPC/IRQ con onComplete => deadlock silencioso de
+                // IO/Audio/Pad y desalineacion de m_invocationSequence.
+                if (GuestThread *th = runtime->eeScheduler().currentThread()) {
+                    th->context.pc = 0x51FEA0u;
+                    th->context.r[31] = _mm_cvtsi64_si128(0x4C0210u);
+                    // $sp/$gp de usuario del juego: solo si quedaron sin inicializar.
+                    if (_mm_cvtsi128_si32(th->context.r[29]) == 0) {
+                        th->context.r[29] = _mm_cvtsi64_si128(0x01fee000u);
+                    }
+                    if (_mm_cvtsi128_si32(th->context.r[28]) == 0) {
+                        th->context.r[28] = _mm_cvtsi64_si128(0x00a28070u);
+                    }
+                }
                 return;
             }
 

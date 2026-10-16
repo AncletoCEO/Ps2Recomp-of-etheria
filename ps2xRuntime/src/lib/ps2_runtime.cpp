@@ -1481,6 +1481,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (isStopRequested() || ctx->pc == 0u)
     {
+        if (!isStopRequested() && ctx->pc == 0u)
+        {
+            // CAZADOR (2026-10-16): una funcion recompilada que ejecuta `jr $ra` con $ra==0
+            // deja ctx->pc en 0. Aca sabemos EXACTAMENTE cual fue la culpable y de donde
+            // venia, en vez de deducirlo del snapshot idle (que publica pc=0 igual).
+            RUNTIME_LOG("[zero-return] CULPRIT: targetFn=0x" << std::hex << targetPc
+                                                             << " entryPc=0x" << entryPc << std::dec
+                                                             << " returned with pc=0 (ra was 0!)"
+                                                             << " tid=" << (m_eeScheduler ? m_eeScheduler->currentThreadId() : 0)
+                                                             << " history=" << formatDispatchHistory());
+        }
         return false;
     }
 

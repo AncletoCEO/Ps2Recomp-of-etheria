@@ -1713,6 +1713,24 @@ void EeScheduler::makeRunning(GuestThread &item)
 
 void EeScheduler::makeDormant(GuestThread &item)
 {
+    // DIAG 2026-10-16: capturar el estado REAL del hilo antes de dormirlo. Despues de esto
+    // publishIdleDebugContext() fuerza m_debugPc=0 / m_debugRa=0, asi que el snapshot no
+    // distingue una muerte por missing-function de un retorno a $ra==0. El hilo 1 NUNCA
+    // debe morir en un juego de PS2: si entra aca, es bug.
+    {
+        const R5900Context &diagCtx = item.activeContext();
+        RUNTIME_LOG("[dormant-trace] id=" << item.id
+                                          << " pc=0x" << std::hex << diagCtx.pc
+                                          << " ra=0x" << getRegU32(&diagCtx, 31)
+                                          << " sp=0x" << getRegU32(&diagCtx, 29)
+                                          << " gp=0x" << getRegU32(&diagCtx, 28) << std::dec
+                                          << " invDepth=" << item.invocations.size()
+                                          << " curTid=" << m_currentThreadId);
+        if (item.id == kMainThreadId)
+        {
+            RUNTIME_LOG("[BUG-ASSERT] MAIN THREAD (id=1) IS BEING KILLED!");
+        }
+    }
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;
