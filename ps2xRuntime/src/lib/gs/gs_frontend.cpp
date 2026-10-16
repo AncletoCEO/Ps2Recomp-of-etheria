@@ -10,9 +10,18 @@
 #include <iostream>
 #include <sstream>
 
+// 2026-10-10 DIAG render: último pc guest de un Store (definido en ps2_runtime.cpp).
+extern uint32_t g_lastStorePc;
+
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    static std::atomic<uint64_t> s_diagTotalKicks{0};
+    static std::atomic<uint64_t> s_diagColoredKicks{0};
+    static std::atomic<uint64_t> s_diagTexturedKicks{0};
+    static std::atomic<uint64_t> s_diagFrameKicks{0};
+    static std::atomic<uint32_t> s_diagInterestingCount{0};
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -540,6 +549,31 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
     }
 
+    {
+        static uint32_t s_latchCount = 0;
+        const uint32_t latchIdx = ++s_latchCount;
+        const uint64_t frameKicks = s_diagFrameKicks.exchange(0);
+        const uint32_t disp1_fbp = static_cast<uint32_t>(request.dispfb1 & 0x1FFu);
+        const uint32_t disp1_fbw = static_cast<uint32_t>((request.dispfb1 >> 9) & 0x3Fu);
+        const uint32_t disp1_psm = static_cast<uint32_t>((request.dispfb1 >> 15) & 0x1Fu);
+        const uint32_t disp2_fbp = static_cast<uint32_t>(request.dispfb2 & 0x1FFu);
+        const uint32_t disp2_fbw = static_cast<uint32_t>((request.dispfb2 >> 9) & 0x3Fu);
+        const uint32_t disp2_psm = static_cast<uint32_t>((request.dispfb2 >> 15) & 0x1Fu);
+        std::cout << "[gs:latch] #" << latchIdx
+                  << " frameKicks=" << frameKicks
+                  << " totalKicks=" << s_diagTotalKicks.load()
+                  << " colored=" << s_diagColoredKicks.load()
+                  << " textured=" << s_diagTexturedKicks.load()
+                  << " | DISPFB1(fbp=" << disp1_fbp << " fbw=" << disp1_fbw << " psm=0x" << std::hex << disp1_psm << std::dec << " raw=0x" << std::hex << request.dispfb1 << std::dec << ")"
+                  << " DISPLAY1=0x" << std::hex << request.display1 << std::dec
+                  << " | DISPFB2(fbp=" << disp2_fbp << " fbw=" << disp2_fbw << " psm=0x" << std::hex << disp2_psm << std::dec << " raw=0x" << std::hex << request.dispfb2 << std::dec << ")"
+                  << " DISPLAY2=0x" << std::hex << request.display2 << std::dec
+                  << " | ctx0(fbp=" << request.contextFrames[0].fbp << " fbw=" << request.contextFrames[0].fbw << " psm=0x" << std::hex << static_cast<uint32_t>(request.contextFrames[0].psm) << " fbmsk=0x" << request.contextFrames[0].fbmsk << std::dec << ")"
+                  << " ctx1(fbp=" << request.contextFrames[1].fbp << " fbw=" << request.contextFrames[1].fbw << " psm=0x" << std::hex << static_cast<uint32_t>(request.contextFrames[1].psm) << " fbmsk=0x" << request.contextFrames[1].fbmsk << std::dec << ")"
+                  << " pmode=0x" << std::hex << request.pmode << std::dec
+                  << std::endl;
+    }
+
     PresentationFrame frame{};
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
@@ -658,6 +692,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if (nreg == 0u)
                 nreg = 16u;
             RUNTIME_LOG("[gs:gif] idx=" << packetIndex
+                                        << " pc=0x" << std::hex << g_lastStorePc << std::dec
                                         << " size=" << sizeBytes
                                         << " nloop=" << nloop
                                         << " flg=" << static_cast<uint32_t>(flg)
@@ -665,6 +700,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                         << " ctx0fbp=" << m_ctx[0].frame.fbp
                                         << " ctx1fbp=" << m_ctx[1].frame.fbp
                                         << std::endl);
+            // 2026-10-10 DIAG: primeros regs crudos del payload (lo de cada qword 16B).
+            auto pay = [&](uint32_t q) -> uint64_t {
+                const uint32_t o = 16u + q * 16u;
+                return (o + 8u <= sizeBytes) ? loadLE64(data + o) : 0ull;
+            };
+            RUNTIME_LOG("[gs:gif]   tagHi=0x" << std::hex << loadLE64(data + 8)
+                        << " regs=" << pay(0) << " " << pay(1) << " " << pay(2) << " " << pay(3)
+                        << std::dec << std::endl);
         }
     });
 
@@ -1166,6 +1209,20 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         std::memcpy(&m_curQ, &qBits, 4);
         if (m_curQ == 0.0f)
             m_curQ = 1.0f;
+        // TRIAGE 2026-10-08: ¿el juego escribe RGBAQ en algún momento?
+        {
+            static uint32_t s_rgbaqWrites = 0;
+            if (s_rgbaqWrites < 8u) {
+                RUNTIME_LOG("[gs:rgbaq] write#" << s_rgbaqWrites
+                             << " rgba=("
+                             << static_cast<uint32_t>(m_curR) << ","
+                             << static_cast<uint32_t>(m_curG) << ","
+                             << static_cast<uint32_t>(m_curB) << ","
+                             << static_cast<uint32_t>(m_curA) << ")"
+                             << std::endl);
+            }
+            ++s_rgbaqWrites;
+        }
         break;
     }
     case GS_REG_ST:
@@ -1336,7 +1393,21 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_ctx[ci].frame.fbp = static_cast<uint32_t>(value & 0x1FF);
         m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
-        m_ctx[ci].frame.fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
+        uint32_t raw_fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
+        static const bool s_bypassFbmsk = []() {
+            const char *env = std::getenv("PS2_FBMSK_BYPASS");
+            return env && (*env == '1' || *env == 'y' || *env == 'Y');
+        }();
+        m_ctx[ci].frame.fbmsk = s_bypassFbmsk ? 0u : raw_fbmsk;
+        std::cout << "[gs:frame] reg=" << (regAddr == GS_REG_FRAME_2 ? "FRAME_2" : "FRAME_1")
+                  << " fbp=" << m_ctx[ci].frame.fbp
+                  << " fbw=" << m_ctx[ci].frame.fbw
+                  << " psm=0x" << std::hex << static_cast<uint32_t>(m_ctx[ci].frame.psm)
+                  << " fbmsk=0x" << raw_fbmsk << std::dec;
+        if (s_bypassFbmsk && raw_fbmsk != 0u) {
+            std::cout << " (BYPASS->0)";
+        }
+        std::cout << std::endl;
         break;
     }
     case GS_REG_ZBUF_1:
@@ -1383,6 +1454,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        static uint32_t s_trxLogCount = 0;
+        if (s_trxLogCount < 20 || (s_trxLogCount % 50) == 0)
+        {
+            std::cout << "[gs:trx] #" << s_trxLogCount
+                      << " dir=" << m_trxdir
+                      << " sbp=" << m_bitbltbuf.sbp << " sbw=" << static_cast<uint32_t>(m_bitbltbuf.sbw) << " spsm=0x" << std::hex << static_cast<uint32_t>(m_bitbltbuf.spsm)
+                      << " -> dbp=" << std::dec << m_bitbltbuf.dbp << " dbw=" << static_cast<uint32_t>(m_bitbltbuf.dbw) << " dpsm=0x" << std::hex << static_cast<uint32_t>(m_bitbltbuf.dpsm)
+                      << " size=(" << std::dec << m_trxreg.rrw << "x" << m_trxreg.rrh << ")"
+                      << std::endl;
+        }
+        ++s_trxLogCount;
 
         if (m_backend)
         {
@@ -1499,7 +1581,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case 0x59:
         if (m_privRegs)
+        {
             m_privRegs->dispfb1 = value;
+            const uint32_t fbp = static_cast<uint32_t>(value & 0x1FFu);
+            const uint32_t fbw = static_cast<uint32_t>((value >> 9) & 0x3Fu);
+            const uint32_t psm = static_cast<uint32_t>((value >> 15) & 0x1Fu);
+            std::cout << "[gs:dispfb] DISPFB1 fbp=" << fbp << " fbw=" << fbw
+                      << " psm=0x" << std::hex << psm << " raw=0x" << value << std::dec << std::endl;
+        }
         break;
     case 0x5a:
         if (m_privRegs)
@@ -1507,7 +1596,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case 0x5b:
         if (m_privRegs)
+        {
             m_privRegs->dispfb2 = value;
+            const uint32_t fbp = static_cast<uint32_t>(value & 0x1FFu);
+            const uint32_t fbw = static_cast<uint32_t>((value >> 9) & 0x3Fu);
+            const uint32_t psm = static_cast<uint32_t>((value >> 15) & 0x1Fu);
+            std::cout << "[gs:dispfb] DISPFB2 fbp=" << fbp << " fbw=" << fbw
+                      << " psm=0x" << std::hex << psm << " raw=0x" << value << std::dec << std::endl;
+        }
         break;
     case 0x5c:
         if (m_privRegs)
@@ -1537,7 +1633,8 @@ void GS::vertexKick(bool drawing)
                                          << " drawing=" << static_cast<uint32_t>(drawing ? 1u : 0u)
                                          << " prim=" << static_cast<uint32_t>(m_prim.type)
                                          << " vtxCount=" << m_vtxCount
-                                         << std::endl);
+                                         << " pc=0x" << std::hex << g_lastStorePc
+                                         << std::dec << std::endl);
         }
     });
 
@@ -1571,6 +1668,56 @@ void GS::vertexKick(bool drawing)
 
     if (m_vtxCount < needed)
         return;
+
+    // 2026-10-08 TRIAGE: loguear color+posición de los primeros 20 kicks y
+    // forzar rojo brillante si el color es negro (atajo para ver si el
+    // backend rasteriza o no).
+    {
+        const uint64_t totalK = ++s_diagTotalKicks;
+        const uint64_t frameK = ++s_diagFrameKicks;
+        const GSVertex &v = m_vtxQueue[(m_vtxCount - 1) % kMaxVerts];
+        const bool hasColor = (v.r != 0 || v.g != 0 || v.b != 0);
+        const auto &curCtx = m_ctx[m_prim.ctxt ? 1 : 0];
+        if (hasColor) ++s_diagColoredKicks;
+        if (m_prim.tme) ++s_diagTexturedKicks;
+
+        if ((hasColor || m_prim.tme) && s_diagInterestingCount.fetch_add(1) < 20u) {
+            const GSTex0Reg &t0 = curCtx.tex0;
+            std::cout << "[gs:content] #" << totalK
+                      << " prim=" << static_cast<uint32_t>(m_prim.type)
+                      << " tme=" << (m_prim.tme ? 1u : 0u)
+                      << " curCtx=" << (m_prim.ctxt ? 1 : 0)
+                      << " fbp=" << curCtx.frame.fbp
+                      << " fbmsk=0x" << std::hex << curCtx.frame.fbmsk << std::dec
+                      << " tex0(tbp0=" << t0.tbp0
+                      << " tbw=" << static_cast<uint32_t>(t0.tbw)
+                      << " psm=" << static_cast<uint32_t>(t0.psm)
+                      << " tw=" << static_cast<uint32_t>(t0.tw)
+                      << " th=" << static_cast<uint32_t>(t0.th) << ")"
+                      << " uv=(" << v.u << "," << v.v << ")"
+                      << " rgba=(" << static_cast<uint32_t>(v.r) << ","
+                      << static_cast<uint32_t>(v.g) << ","
+                      << static_cast<uint32_t>(v.b) << ","
+                      << static_cast<uint32_t>(v.a) << ")"
+                      << " xyz=(" << v.x << "," << v.y << "," << v.z << ")"
+                      << std::endl;
+        }
+        if ((totalK % 200u) == 0u) {
+            std::cout << "[gs:content] KICKS total=" << totalK
+                      << " frame=" << frameK
+                      << " colored=" << s_diagColoredKicks.load()
+                      << " textured=" << s_diagTexturedKicks.load()
+                      << " curCtx=" << (m_prim.ctxt ? 1 : 0)
+                      << " fbp=" << curCtx.frame.fbp
+                      << " fbmsk=0x" << std::hex << curCtx.frame.fbmsk << std::dec
+                      << " tex0_tbp=" << curCtx.tex0.tbp0
+                      << " last_rgba=(" << static_cast<uint32_t>(v.r) << ","
+                      << static_cast<uint32_t>(v.g) << ","
+                      << static_cast<uint32_t>(v.b) << ","
+                      << static_cast<uint32_t>(v.a) << ")"
+                      << std::endl;
+        }
+    }
 
     if (drawing && m_backend)
     {

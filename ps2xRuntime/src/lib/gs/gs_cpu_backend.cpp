@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -818,7 +819,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         }
     });
 
-    switch (state.prim.type)
+    switch (batch.state.prim.type)
     {
     case GS_PRIM_SPRITE:
         DrawSprite(batch);
@@ -835,10 +836,10 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     case GS_PRIM_POINT:
     {
         const GSVertex &v = batch.vertices[0];
-        const auto &ctx = state.context;
+        const auto &ctx = batch.state.context;
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        WritePixel(state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+        WritePixel(batch.state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
     default:
@@ -1845,6 +1846,85 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
 
 PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 {
+    // 2026-10-10 DIAG: volcar el VRAM del recomp una vez (para diffear contra el real).
+    // Env: SWORD_DUMP_VRAM=1 → /tmp/recomp_vram.bin (4 MB) al present #1500.
+    if (const char *vp = std::getenv("SWORD_DUMP_VRAM"); vp != nullptr && *vp != '\0')
+    {
+        static uint32_t s_presentN = 0u;
+        if (++s_presentN == 1500u)
+        {
+            std::ofstream out("/tmp/recomp_vram.bin", std::ios::binary);
+            if (out && m_vram != nullptr && m_vramSize != 0u)
+                out.write(reinterpret_cast<const char *>(m_vram), m_vramSize);
+            std::cout << "[dump-vram] n=" << s_presentN << " size=" << m_vramSize << std::endl;
+        }
+    }
+
+    // 2026-10-10 DIAG: patrón de prueba forzado para validar el camino de presentación
+    // (GS backend -> host frame -> pantalla), independiente de lo que dibuje el juego.
+    // Env: SWORD_TEST_PATTERN=1. Devuelve un gradiente con "HELLO WORLD" en amarillo.
+    if (const char *tp = std::getenv("SWORD_TEST_PATTERN"); tp != nullptr && *tp != '\0')
+    {
+        static const uint8_t kGlyphs[8][7] = {
+            {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, // H
+            {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}, // E
+            {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}, // L
+            {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // O
+            {0x11, 0x11, 0x11, 0x11, 0x11, 0x15, 0x0A}, // W
+            {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}, // R
+            {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}, // D
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // (space)
+        };
+        static const int kMsg[] = {0, 1, 2, 2, 3, 7, 4, 3, 5, 2, 6}; // HELLO WORLD
+        PresentationFrame pat{};
+        pat.width = kHostFrameWidth;
+        pat.height = kHostFrameHeight;
+        pat.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+        for (uint32_t y = 0; y < kHostFrameHeight; ++y)
+            for (uint32_t x = 0; x < kHostFrameWidth; ++x)
+            {
+                uint8_t *p = pat.pixels.data() + (static_cast<size_t>(y) * kHostFrameWidth + x) * 4u;
+                p[0] = static_cast<uint8_t>(x * 255u / (kHostFrameWidth - 1u));
+                p[1] = static_cast<uint8_t>(y * 255u / (kHostFrameHeight - 1u));
+                p[2] = 64u;
+                p[3] = 255u;
+            }
+        constexpr int scale = 8, gw = 5, gh = 7, gap = 1;
+        const int textW = static_cast<int>(sizeof(kMsg) / sizeof(kMsg[0])) * (gw + gap) * scale;
+        const int ox = static_cast<int>(kHostFrameWidth) / 2 - textW / 2;
+        const int oy = static_cast<int>(kHostFrameHeight) / 2 - gh * scale / 2;
+        for (size_t c = 0; c < sizeof(kMsg) / sizeof(kMsg[0]); ++c)
+        {
+            const uint8_t *g = kGlyphs[kMsg[c]];
+            for (int ry = 0; ry < gh; ++ry)
+                for (int rx = 0; rx < gw; ++rx)
+                    if ((g[ry] & (1u << (gw - 1 - rx))) != 0u)
+                        for (int sy = 0; sy < scale; ++sy)
+                            for (int sx = 0; sx < scale; ++sx)
+                            {
+                                const int px = ox + static_cast<int>(c) * (gw + gap) * scale + rx * scale + sx;
+                                const int py = oy + ry * scale + sy;
+                                if (px >= 0 && px < static_cast<int>(kHostFrameWidth) &&
+                                    py >= 0 && py < static_cast<int>(kHostFrameHeight))
+                                {
+                                    uint8_t *p = pat.pixels.data() +
+                                                 (static_cast<size_t>(py) * kHostFrameWidth + static_cast<uint32_t>(px)) * 4u;
+                                    p[0] = 255u;
+                                    p[1] = 255u;
+                                    p[2] = 0u;
+                                    p[3] = 255u;
+                                }
+                            }
+        }
+        static bool s_logged = false;
+        if (!s_logged)
+        {
+            s_logged = true;
+            std::cout << "[test-pattern] HELLO WORLD " << kHostFrameWidth << "x" << kHostFrameHeight << std::endl;
+        }
+        return pat;
+    }
+
     // Snapshot local memory under the backend lock, then perform the expensive
     // display conversion without holding the producer-side raster lock.
     thread_local std::vector<uint8_t> snapshot;
@@ -1873,8 +1953,30 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     decodeDisplaySize(request.display2, width2, height2);
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+    static uint32_t s_presentLogCount = 0;
+    s_presentLogCount++;
+    if (s_presentLogCount < 10 || (s_presentLogCount % 10) == 0)
+    {
+        uint32_t totalNonZero = 0;
+        for (size_t i = 0; i < m_vramSize; ++i) {
+            if (m_vram[i] != 0) totalNonZero++;
+        }
+        std::cout << "[gs:present] #" << s_presentLogCount
+                  << " valid1=" << valid1 << " valid2=" << valid2
+                  << " pmode=0x" << std::hex << request.pmode
+                  << " dispfb1=0x" << request.dispfb1
+                  << " display1=0x" << request.display1
+                  << " dispfb2=0x" << request.dispfb2
+                  << " display2=0x" << request.display2
+                  << " vramNonZero=" << std::dec << totalNonZero << "/" << m_vramSize
+                  << std::endl;
+    }
     if (!valid1 && !valid2)
         return result;
+
+    static uint32_t s_pixelDiagCount = 0;
+    const uint32_t diagIndex = ++s_pixelDiagCount;
+    const bool logDiag = (diagIndex <= 10 || (diagIndex % 5) == 0);
 
     auto copySource = [&](const GSFrameReg &displayFrame,
                           const GSDisplayReadOrigin &origin,
@@ -1926,6 +2028,25 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
             copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
         {
+            if (logDiag)
+            {
+                uint32_t crt1RgbNonZero = 0, crt1AlphaNonZero = 0;
+                uint32_t crt2RgbNonZero = 0, crt2AlphaNonZero = 0;
+                for (size_t i = 0; i < crt1.size(); i += 4) {
+                    if (crt1[i] != 0 || crt1[i+1] != 0 || crt1[i+2] != 0) crt1RgbNonZero++;
+                    if (crt1[i+3] != 0) crt1AlphaNonZero++;
+                }
+                for (size_t i = 0; i < crt2.size(); i += 4) {
+                    if (crt2[i] != 0 || crt2[i+1] != 0 || crt2[i+2] != 0) crt2RgbNonZero++;
+                    if (crt2[i+3] != 0) crt2AlphaNonZero++;
+                }
+                std::cout << "[gs:diag] crt1 (fbp=" << selected1.fbp << "): rgbNZ=" << crt1RgbNonZero << " aNZ=" << crt1AlphaNonZero
+                          << " | crt2 (fbp=" << selected2.fbp << "): rgbNZ=" << crt2RgbNonZero << " aNZ=" << crt2AlphaNonZero
+                          << " | ctx0(fbp=" << request.contextFrames[0].fbp << " fbmsk=0x" << std::hex << request.contextFrames[0].fbmsk << std::dec << ")"
+                          << " ctx1(fbp=" << request.contextFrames[1].fbp << " fbmsk=0x" << std::hex << request.contextFrames[1].fbmsk << std::dec << ")"
+                          << " pmode.alp=" << static_cast<uint32_t>(pmode.alp)
+                          << " mmod=" << pmode.mmod << " slbg=" << pmode.slbg << std::endl;
+            }
             result.width = std::max(width1, width2);
             result.height = std::max(height1, height2);
             result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
