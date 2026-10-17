@@ -384,7 +384,7 @@ namespace ps2_syscalls
             RUNTIME_LOG("[rpc-call] client=0x" << std::hex << clientPtr << " rpcNum=0x" << rpcNum
                         << " trackedSid=0x" << trackedSid << " hdr.rpc_id=0x" << hdrRpcId
                         << " hdr.sema_id=0x" << hdrSemaId << " hdr.server=0x" << hdrServer
-                        << std::dec);
+                        << std::dec << " vsync=" << runtime->eeScheduler().currentVSyncTick());
         }
 
         const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
@@ -781,7 +781,8 @@ namespace ps2_syscalls
             };
             RUNTIME_LOG("[rpc-callback] invocando callback 0x" << std::hex << callbackFunction
                         << " endParam=0x" << endParameter << " sema=0x" << completionSemaphore
-                        << " sid=0x" << sid << std::dec);
+                        << " sid=0x" << sid << std::dec
+                        << " vsync=" << runtime->eeScheduler().currentVSyncTick());
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 

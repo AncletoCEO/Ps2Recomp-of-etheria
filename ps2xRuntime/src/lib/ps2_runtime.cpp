@@ -2494,23 +2494,58 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     if (vaddr == 0x10009000u && (value & 0x100u) != 0u)
     {
         static uint64_t s_vif1Kick = 0;
+        static uint64_t s_vif1KickWithData = 0;
         ++s_vif1Kick;
-        if (s_vif1Kick <= 30ull || (s_vif1Kick % 500ull) == 0ull)
+        uint32_t madr = 0u, qwc = 0u;
+        try
         {
-            uint32_t madr = 0u, qwc = 0u;
-            try
-            {
-                madr = m_memory.read32(0x10009010u);
-                qwc = m_memory.read32(0x10009020u);
-            }
-            catch (const std::exception &)
-            {
-            }
+            madr = m_memory.read32(0x10009010u);
+            qwc = m_memory.read32(0x10009020u);
+        }
+        catch (const std::exception &)
+        {
+        }
+        // 2026-10-17: sin el corte en n<=25. El rate-limit viejo hacia imposible saber si los
+        // kicks seguian vacios despues del boot (se afirmo "kicks vacios" con 25 muestras).
+        // Ahora: primer tramo + CADA kick con datos (hasta 64) + resumen cada 600.
+        const bool kickHasData = (qwc & 0xFFFFu) != 0u;
+        if (kickHasData)
+        {
+            ++s_vif1KickWithData;
+        }
+        if (s_vif1Kick <= 30ull || (kickHasData && s_vif1KickWithData <= 64ull) ||
+            (s_vif1Kick % 600ull) == 0ull)
+        {
             RUNTIME_LOG("[dma:kick] VIF1 CHCR=0x" << std::hex << value
                         << " madr=0x" << madr << " qwc=0x" << (qwc & 0xFFFFu)
                         << " pc=0x" << ctx->pc
                         << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
-                        << std::dec << " n=" << s_vif1Kick);
+                        << std::dec << " n=" << s_vif1Kick
+                        << " withData=" << s_vif1KickWithData);
+        }
+    }
+    // 2026-10-17: auditoria de registros de canal DMA (0x10008000-0x1000AFFF): quien escribe
+    // CHCR/MADR/QWC y con que valor. El kick VIF1 sale SIEMPRE madr=0/qwc=0 (395001 kicks en
+    // 180 s, withData=0) => no transfiere nada. Se loguea solo cuando el valor de un registro
+    // cambia respecto del ultimo visto (dedup por slot de 16 B), capped, para no inundar.
+    if (vaddr >= 0x10008000u && vaddr < 0x1000B000u && (vaddr & 0xFu) == 0u)
+    {
+        static uint32_t s_dmaLast[768] = {};
+        static bool s_dmaSeen[768] = {};
+        static uint64_t s_dmaLogs = 0;
+        const size_t slot = static_cast<size_t>((vaddr - 0x10008000u) >> 4);
+        if (slot < 768u && (!s_dmaSeen[slot] || s_dmaLast[slot] != value))
+        {
+            s_dmaSeen[slot] = true;
+            s_dmaLast[slot] = value;
+            if (s_dmaLogs < 400ull)
+            {
+                ++s_dmaLogs;
+                RUNTIME_LOG("[dma-reg] addr=0x" << std::hex << vaddr << " val=0x" << value
+                            << " pc=0x" << ctx->pc
+                            << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                            << std::dec << " n=" << s_dmaLogs);
+            }
         }
     }
     // TRIAGE 2026-10-08: watchpoint en gp+0x638/0x63C (head/tail) y gp-0x7A30 (cb).

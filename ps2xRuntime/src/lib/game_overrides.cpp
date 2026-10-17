@@ -5733,6 +5733,35 @@ namespace
                 savePresentationBmp(runtime, filename.c_str());
             }
 
+            // 2026-10-17: perfil del tick. Cuantos ciclos EE y cuantos VBlank consume cada
+            // "frame" del juego, y en que estado quedan los hilos. Es la pregunta que reemplaza
+            // a "el frame esta congelado": el tick corre a ~5-7/s contra 60 VBlank/s (si el
+            // reloj es real, el juego esta recibiendo ~9 VBlank por tick que no aprovecha).
+            static uint64_t s_lastCycle = 0ull;
+            static uint64_t s_lastVsync = 0ull;
+            static uint32_t s_lastFrame = 0u;
+            if (runtime != nullptr && (s_frameCounter <= 3u || (s_frameCounter % 10u) == 0u)) {
+                const EeKernelSnapshot snap = runtime->eeScheduler().snapshot();
+                const uint64_t vs = runtime->eeScheduler().currentVSyncTick();
+                const uint32_t dTick = (s_frameCounter > s_lastFrame) ? (s_frameCounter - s_lastFrame) : 1u;
+                std::ostringstream oss;
+                oss << "[tick-prof] f=" << s_frameCounter << " dTick=" << dTick
+                    << " eeCycle=" << snap.eeCycle
+                    << " dCycle=" << (snap.eeCycle - s_lastCycle)
+                    << " cycPerTick=" << ((snap.eeCycle - s_lastCycle) / dTick)
+                    << " vsync=" << vs << " dVsync=" << (vs - s_lastVsync)
+                    << " run=" << snap.runningThreadId;
+                for (const EeThreadSnapshot &t : snap.threads) {
+                    oss << " [id=" << t.id << " pc=0x" << std::hex << t.pc << " ra=0x" << t.ra
+                        << std::dec << " st=" << static_cast<int>(t.status)
+                        << " wr=" << static_cast<int>(t.waitReason) << " wid=" << t.waitId << "]";
+                }
+                RUNTIME_LOG(oss.str());
+                s_lastCycle = snap.eeCycle;
+                s_lastVsync = vs;
+                s_lastFrame = s_frameCounter;
+            }
+
             ctx->pc = 0x0050f750u;
             // 2026-10-11: delegar en el ORIGINAL de 0x50f750 (antes corria el stub
             // FUN_004eb8d0, workaround de cuando las megas tenian el End inflado).
