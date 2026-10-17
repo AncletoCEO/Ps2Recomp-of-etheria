@@ -4081,15 +4081,16 @@ namespace
         };
         runtime.replaceFunction(0x004ea200u, padReadStub);
 
-        // 0x004ea2b8: scePadSetMainMode(port, slot, mode, lock)
-        static auto padSetMainModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
-            ps2_stubs::scePadSetMainMode(rdram, ctx, runtime);
-            ctx->r[2] = _mm_cvtsi32_si128(1);
-            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
-        };
-        runtime.replaceFunction(0x004ea2b8u, padSetMainModeStub);
+        // ==== 2026-10-17: TABLA CORREGIDA (estaba corrida una función desde 0x4ea2b8) ====
+        // Antes: 0x4ea2b8 -> padSetMainModeStub (devolvía 1 = PAD_STATE_FINDPAD) y 0x4ea460 ->
+        // padGetStateStub, etc. Verificado contra el generado:
+        //   FUN_004ea2b8 lee lbu 0x70($s0) (state) y lbu 0x71($s0) (reqState)  => scePadGetState
+        //   FUN_004ea460 lee lbu 0x71($v0)                                     => scePadGetReqState
+        // Por eso el juego guardaba state=1 en *(port+0x8C), su wrapper devolvía 3 (inicializando) y
+        // FUN_00500570 nunca pasaba del substep 2 (barrera del pad). El log [pad-getstate] nunca
+        // disparaba porque 0x4ea460 es GetReqState, que sólo se consulta con state 6/2.
 
-        // 0x004ea460: scePadGetState(port, slot) -> returns state in $v0 (6 = STABLE)
+        // 0x004ea2b8: scePadGetState(port, slot) -> $v0 = 6 (PAD_STATE_STABLE)
         static auto padGetStateStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             ps2_stubs::scePadGetState(rdram, ctx, runtime);
             int32_t state = _mm_cvtsi128_si32(ctx->r[2]);
@@ -4099,59 +4100,111 @@ namespace
             }
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x004ea460u, padGetStateStub);
+        runtime.replaceFunction(0x004ea2b8u, padGetStateStub);
 
-        // 0x004ea4e8: scePadGetReqState(port, slot) -> returns req state in $v0 (0 = complete)
+        // 0x004ea3b8: scePadSetReqState(port, slot, state) -> 1
+        static auto padSetReqStateStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            (void)rdram; (void)runtime;
+            ctx->r[2] = _mm_cvtsi32_si128(1);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004ea3b8u, padSetReqStateStub);
+
+        // 0x004ea460: scePadGetReqState(port, slot) -> $v0 = 0 (PAD_RSTAT_COMPLETE)
         static auto padGetReqStateStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             (void)rdram; (void)runtime;
-            ctx->r[2] = _mm_setzero_si128(); // 0 = complete
+            ctx->r[2] = _mm_setzero_si128();
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x004ea4e8u, padGetReqStateStub);
+        runtime.replaceFunction(0x004ea460u, padGetReqStateStub);
 
-        // 0x004ea728: scePadInfoMode(port, slot, term, offs) -> returns mode/count in $v0
-        static auto padInfoModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
-            ps2_stubs::scePadInfoMode(rdram, ctx, runtime);
-            int32_t res = _mm_cvtsi128_si32(ctx->r[2]);
-            if (res == 0) {
-                res = 7; // DualShock 2
-                ctx->r[2] = _mm_cvtsi32_si128(res);
-            }
-            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
-        };
-        runtime.replaceFunction(0x004ea728u, padInfoModeStub);
-
-        // 0x004ea860: scePadSetMainModeRpc(port, slot, actNo, term)
+        // 0x004ea4e8: scePadInfoAct(port, slot, act, len)
         static auto padInfoActStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             ps2_stubs::scePadInfoAct(rdram, ctx, runtime);
             ctx->r[2] = _mm_cvtsi32_si128(1);
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x004ea860u, padInfoActStub);
+        runtime.replaceFunction(0x004ea4e8u, padInfoActStub);
 
-        // 0x004ea918: scePadInfoComb(port, slot, type, id)
+        // 0x004ea608: scePadInfoComb(port, slot, type, id)
         static auto padInfoCombStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             ps2_stubs::scePadInfoComb(rdram, ctx, runtime);
             ctx->r[2] = _mm_setzero_si128();
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x004ea918u, padInfoCombStub);
+        runtime.replaceFunction(0x004ea608u, padInfoCombStub);
 
-        // 0x004ea9d8: scePadSetActDirectRpc
-        static auto padSetActDirectRpcStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+        // 0x004ea728: scePadInfoMode(port, slot, term, offs) -> $v0 = modo/cantidad
+        // (se quitó el hack "res == 0 -> 7": corrompía term=3 [PAD_MODECUROFFS])
+        static auto padInfoModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            ps2_stubs::scePadInfoMode(rdram, ctx, runtime);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004ea728u, padInfoModeStub);
+
+        // 0x004ea860: scePadSetMainMode(port, slot, mode, lock) -> 1
+        static auto padSetMainModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            ps2_stubs::scePadSetMainMode(rdram, ctx, runtime);
+            ctx->r[2] = _mm_cvtsi32_si128(1);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004ea860u, padSetMainModeStub);
+
+        // 0x004ea918: scePadSetActDirect(port, slot, data) -> 1
+        static auto padSetActDirectStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             (void)rdram; (void)runtime;
             ctx->r[2] = _mm_cvtsi32_si128(1);
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x004ea9d8u, padSetActDirectRpcStub);
+        runtime.replaceFunction(0x004ea918u, padSetActDirectStub);
 
-        // 0x004eac18: scePadEnterPressMode(port, slot)
+        // 0x004ea9d8: scePadSetActAlign(port, slot, data) -> 1
+        static auto padSetActAlignStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            (void)rdram; (void)runtime;
+            ctx->r[2] = _mm_cvtsi32_si128(1);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004ea9d8u, padSetActAlignStub);
+
+        // 0x004eaab0: scePadGetButtonMask(port, slot) -> 0x3FFFF
+        static auto padGetButtonMaskStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            (void)rdram; (void)runtime;
+            ctx->r[2] = _mm_cvtsi32_si128(0x3FFFF);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004eaab0u, padGetButtonMaskStub);
+
+        // 0x004eab68: scePadSetButtonInfo(port, slot, data) -> 1
+        static auto padSetButtonInfoStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            (void)rdram; (void)runtime;
+            ctx->r[2] = _mm_cvtsi32_si128(1);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004eab68u, padSetButtonInfoStub);
+
+        // 0x004eac18: scePadInfoPressMode(port, slot) -> 1
+        static auto padInfoPressModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            ps2_stubs::scePadInfoPressMode(rdram, ctx, runtime);
+            ctx->r[2] = _mm_cvtsi32_si128(1);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004eac18u, padInfoPressModeStub);
+
+        // 0x004eac78: scePadEnterPressMode(port, slot) -> 1
         static auto padEnterPressModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             ps2_stubs::scePadEnterPressMode(rdram, ctx, runtime);
             ctx->r[2] = _mm_cvtsi32_si128(1);
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x004eac18u, padEnterPressModeStub);
+        runtime.replaceFunction(0x004eac78u, padEnterPressModeStub);
+
+        // 0x004eacd0: scePadExitPressMode(port, slot) -> 1
+        static auto padExitPressModeStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            ps2_stubs::scePadExitPressMode(rdram, ctx, runtime);
+            ctx->r[2] = _mm_cvtsi32_si128(1);
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.replaceFunction(0x004eacd0u, padExitPressModeStub);
 
         // 0x004eadf8: scePadEnd() -> returns 1
         static auto padEndStub = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
@@ -5759,6 +5812,35 @@ namespace
                     std::memcpy(&phaseFC, rdram + ((phasePtr & 0x01FFFFFFu) + 0xCu), 4);
                 }
             }
+            // 2026-10-17 (v65 de Gemini, verificado contra los .p2s): el freno entre el estado "draw"
+            // y el menú es la transicion de Task#1 de FUN_00500570 a FUN_00500490, que spawnea la 4a
+            // tarea (count 3 -> 4, la que dibuja el menú "Select video format"). Se leen los 4 puntos:
+            //   root = *(mgr+0x10): +0x20 handler activo (0x500570 vs 0x500490), +0x38 substep
+            //   t3 = *(*(mgr+4)+8): +0x08 state, +0x38 substep
+            //   loader = *(gp-0x348) -> entry0 = *(loader+0x6C): +8 id, +0xC state (1|2|3)
+            uint32_t tMgr = 0u, tRoot = 0u, tRootH20 = 0u, tRootSub = 0u, tT3 = 0u, tT3St = 0u, tT3Sub = 0u;
+            uint32_t tLoad = 0u, tEntry = 0u, tEntryId = 0u, tEntryState = 0u;
+            {
+                auto rd32 = [&](uint32_t addr) -> uint32_t {
+                    uint32_t v = 0u;
+                    const uint32_t a = addr & 0x01FFFFFFu;
+                    if (a + 4u <= PS2_RAM_SIZE)
+                        std::memcpy(&v, rdram + a, 4);
+                    return v;
+                };
+                const uint32_t gpD = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
+                tMgr = rd32(gpD - 0x324u);
+                tRoot = rd32(tMgr + 0x10u);
+                tRootH20 = rd32(tRoot + 0x20u);
+                tRootSub = rd32(tRoot + 0x38u);
+                tT3 = rd32(rd32(tMgr + 4u) + 8u);
+                tT3St = rd32(tT3 + 8u);
+                tT3Sub = rd32(tT3 + 0x38u);
+                tLoad = rd32(gpD - 0x348u);
+                tEntry = rd32(tLoad + 0x6Cu);
+                tEntryId = rd32(tEntry + 8u);
+                tEntryState = rd32(tEntry + 0xCu) & 0xFFu;
+            }
             if (runtime != nullptr && (s_frameCounter <= 3u || (s_frameCounter % 10u) == 0u)) {
                 const EeKernelSnapshot snap = runtime->eeScheduler().snapshot();
                 const uint64_t vs = runtime->eeScheduler().currentVSyncTick();
@@ -5783,6 +5865,13 @@ namespace
                         << " wr=" << static_cast<int>(t.waitReason) << " wid=" << t.waitId << "]";
                 }
                 RUNTIME_LOG(oss.str());
+                RUNTIME_LOG("[task] f=" << s_frameCounter
+                            << " mgr=0x" << std::hex << tMgr << " root=0x" << tRoot
+                            << " h20=0x" << tRootH20 << std::dec << " sub=" << tRootSub
+                            << " t3=0x" << std::hex << tT3 << std::dec << " t3st=" << tT3St
+                            << " t3sub=" << tT3Sub
+                            << " ldId=0x" << std::hex << tEntryId << std::dec
+                            << " ldSt=" << tEntryState);
                 s_lastCycle = snap.eeCycle;
                 s_lastVsync = vs;
                 s_lastFrame = s_frameCounter;

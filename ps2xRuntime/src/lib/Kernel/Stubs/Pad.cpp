@@ -542,17 +542,21 @@ namespace ps2_stubs
         case 2: // PAD_MODECUREXID
             setReturnS32(ctx, currentId);
             return;
-        case 3: // PAD_MODECUROFFS
-            setReturnS32(ctx, 0);
+        case 3: // PAD_MODECUROFFS  (offset del modo actual DENTRO de la tabla de modos)
+            setReturnS32(ctx, portState->analogMode ? 1 : 0);
             return;
-        case 4: // PAD_MODETABLE
-            if (index == -1)
+        case 4: // PAD_MODETABLE: {4 = digital, 7 = DualShock2}
+            if (index < 0)
             {
-                setReturnS32(ctx, 1); // one available mode
+                setReturnS32(ctx, 2); // dos modos disponibles
             }
             else if (index == 0)
             {
-                setReturnS32(ctx, currentId);
+                setReturnS32(ctx, kPadTypeDigital);
+            }
+            else if (index == 1)
+            {
+                setReturnS32(ctx, kPadTypeDualShock);
             }
             else
             {
