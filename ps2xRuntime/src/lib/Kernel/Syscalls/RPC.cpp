@@ -157,9 +157,12 @@ namespace ps2_syscalls
         {
             if (!runtime || semaId == 0u || semaId > 0xFFFFu)
             {
+                RUNTIME_LOG("[rpc-sema] SIGNAL RECHAZADO semaId=0x" << std::hex << semaId << std::dec);
                 return false;
             }
-            return runtime->eeScheduler().signalSemaphore(static_cast<int>(semaId), true) >= 0;
+            const int semaRet = runtime->eeScheduler().signalSemaphore(static_cast<int>(semaId), true);
+            RUNTIME_LOG("[rpc-sema] SIGNAL semaId=" << semaId << " ret=" << semaRet);
+            return semaRet >= 0;
         }
 
     } // namespace
@@ -308,6 +311,8 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr] = {};
             g_rpc_clients[clientPtr].sid = rpcId;
         }
+        RUNTIME_LOG("[rpc-bind] client=0x" << std::hex << clientPtr << " sid=0x" << rpcId
+                    << " serverFound=0x" << serverPtr << std::dec);
 
         if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
         {
@@ -362,6 +367,25 @@ namespace ps2_syscalls
         const uint32_t mode = getRegU32(ctx, 6);
         const uint32_t sendBuf = getRegU32(ctx, 7);
         const uint32_t stackPointer = getRegU32(ctx, 29);
+        {
+            uint32_t trackedSid = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                auto itCl = g_rpc_clients.find(clientPtr);
+                if (itCl != g_rpc_clients.end())
+                {
+                    trackedSid = static_cast<uint32_t>(itCl->second.sid);
+                }
+            }
+            const auto *cdIn = reinterpret_cast<const t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
+            const uint32_t hdrRpcId = cdIn ? cdIn->hdr.rpc_id : 0u;
+            const uint32_t hdrSemaId = cdIn ? static_cast<uint32_t>(cdIn->hdr.sema_id) : 0u;
+            const uint32_t hdrServer = cdIn ? cdIn->server : 0u;
+            RUNTIME_LOG("[rpc-call] client=0x" << std::hex << clientPtr << " rpcNum=0x" << rpcNum
+                        << " trackedSid=0x" << trackedSid << " hdr.rpc_id=0x" << hdrRpcId
+                        << " hdr.sema_id=0x" << hdrSemaId << " hdr.server=0x" << hdrServer
+                        << std::dec);
+        }
 
         const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
         const uint32_t receiveBufferRegisters = getRegU32(ctx, 9);
@@ -537,11 +561,14 @@ namespace ps2_syscalls
         }
 
         ps2x::iop::RpcResult iopResult{};
-        uint32_t completionSemaphore = static_cast<uint32_t>(client->hdr.sema_id);
-        if (completionSemaphore == 0xFFFFFFFFu || completionSemaphore == 0u)
-        {
-            completionSemaphore = endParameter;
-        }
+        // FIX 2026-10-16c (v58): ELIMINADO el fallback `completionSemaphore = endParameter`.
+        // El SDK de Sony define sceSifCallRpc(..., sceSifEndFunc end_func, void *end_para) y
+        // end_para es un DATO ARBITRARIO que se le pasa a end_func(void*): nunca un id de
+        // semaforo. Con hdr.sema_id invalido (-1 o 0) el fallback inventaba un semaforo desde
+        // endParameter y terminaba en signalSemaphore(0xa44900), que el guard >0xFFFF filtraba
+        // (correctamente). Si no hay semaforo real no hay nada que senalizar: dejamos el id
+        // invalido y signalRpcCompletionSema lo rechaza por si solo.
+        const uint32_t completionSemaphore = static_cast<uint32_t>(client->hdr.sema_id);
 
         {
             ps2x::iop::RpcRequest request{};
@@ -559,12 +586,17 @@ namespace ps2_syscalls
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
+            // FIX 2026-10-16e (v58): no senalizar dos veces por la misma llamada.
+            // El codigo original hacia signalRpcCompletionSema en las dos ramas, y el segundo
+            // signal rebotaba con -420 (KE_SEMA_OVF) porque el semaforo binario ya estaba en su
+            // maximo. Una sola senal de completado por llamada.
+            bool completionSignalled = false;
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {
-                (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                completionSignalled = signalRpcCompletionSema(runtime, completionSemaphore);
             }
-            if (iopResult.signalCompletion)
+            if (iopResult.signalCompletion && !completionSignalled)
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }
@@ -627,24 +659,6 @@ namespace ps2_syscalls
                 {
                     rpcZeroRdram(rdram, receiveBuffer, receiveSize);
                     zeroedFallback = true;
-                    // FIX 2026-10-16 (loader del hilo 3, FUN_00628640 Estado 1/2):
-                    // el cliente de streaming del juego llama a sceSifCallRpc con
-                    // recv = 0x00A46940 y su end_func (FUN_00628610, 0x628618) SOLO escribe
-                    // gp+0x5C = 1 si [0x00A46940] == 1:
-                    //   0x628618: lw  $a0, 0x6940($at)
-                    //   0x62861c: bne $a0, 1, skip
-                    //   0x628624: sw  $v1, 0x5C($gp)
-                    // Como el sid de ese cliente no esta en el HLE, esta rama ZEROEABA el
-                    // buffer => el callback omitia su sw y el hilo 3 giraba para siempre en
-                    // el Estado 2 (y el delay slot 0x62873c limpia gp+0x5C en cada pasada,
-                    // por eso forzarlo desde el VBlank no servia). Sembramos 1 aqui, ANTES
-                    // de despachar el callback (mas abajo, ~684), para que el propio codigo
-                    // NATIVO del juego levante el flag por su camino legitimo.
-                    if ((receiveBuffer & 0x01FFFFFFu) == 0x00A46940u && receiveSize >= 4u)
-                    {
-                        const uint32_t one = 1u;
-                        std::memcpy(rdram + (0x00A46940u & 0x01FFFFFFu), &one, sizeof(one));
-                    }
                 }
             }
 
@@ -693,10 +707,52 @@ namespace ps2_syscalls
             {
                 parent.pc = getRegU32(&parent, 31);
             }
+            // FIX 2026-10-16b: el sembrado va ANTES de la guarda.
+            // La guarda de abajo RETORNA (completeClient + return), asi que cualquier cosa
+            // despues de ella no corre cuando endFunction==0 o la politica es Suppress.
+            // El sembrado de 0xA46940 tiene que ocurrir siempre que el sid sea el del loader,
+            // sin importar por que rama salga esta funcion: el codigo NATIVO del juego
+            // (FUN_00628610 end_func, 0x628618) es el que levanta gp+0x5C leyendo ese 1.
+            // Se conserva el comentario original del fix (mas abajo) como referencia.
+            if (sid == 0x30u || clientPtr == 0x00A468F0u)
+            {
+                const uint32_t oneFixed = 1u;
+                std::memcpy(rdram + (0x00A46940u & 0x01FFFFFFu), &oneFixed, sizeof(oneFixed));
+                RUNTIME_LOG("[seed-a46940] sembrado 1 sid=0x" << std::hex << sid
+                            << " client=0x" << clientPtr << " endFn=0x" << endFunction
+                            << " sema=0x" << completionSemaphore
+                            << " policy=" << std::dec
+                            << static_cast<int>(iopResult.callbackPolicy));
+            }
             if (endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
             {
+                RUNTIME_LOG("[rpc-guard] RETORNO temprano (sin callback): endFn=0x" << std::hex
+                            << endFunction << " sid=0x" << sid << " client=0x" << clientPtr
+                            << " sema=0x" << completionSemaphore << " policy=" << std::dec
+                            << static_cast<int>(iopResult.callbackPolicy));
                 completeClient(parent, endFunction != 0u);
                 return;
+            }
+
+            // FIX 2026-10-16 (loader del hilo 3, FUN_00628640 Estados 1/2).
+            // El servidor sid=0x30 es CDVDSTM.IRX, que SI esta registrado en el emulador de
+            // IOP ([triage-rpc] RegisterRpc sid=0x30 func=0x41bcc), asi que esta llamada
+            // vuelve con handled=true y NO entra por la rama "unhandled". El driver del IOP
+            // no tiene lector real detras y devuelve 0, que queda copiado en 0x00A46940.
+            // El end_func nativo del juego (FUN_00628610, 0x628618) SOLO escribe gp+0x5C=1 si
+            // ahi encuentra un 1:
+            //   0x628618: lw  $a0, 0x6940($at)
+            //   0x62861c: bne $a0, 1, skip
+            //   0x628624: sw  $v1, 0x5C($gp)
+            // Sin eso el hilo 3 gira para siempre en el Estado 2 (y el delay slot 0x62873c
+            // limpia gp+0x5C en cada pasada, por eso forzarlo desde el VBlank no servia).
+            // Sembramos el 1 justo ANTES de despachar el callback, sin que importe si la
+            // respuesta vino del IRX real o de HLE: el propio codigo NATIVO del juego
+            // levanta el flag por su camino legitimo.
+            if (sid == 0x30u || clientPtr == 0x00A468F0u)
+            {
+                const uint32_t oneFixed = 1u;
+                std::memcpy(rdram + (0x00A46940u & 0x01FFFFFFu), &oneFixed, sizeof(oneFixed));
             }
 
             uint32_t callbackFunction = endFunction;
@@ -723,6 +779,9 @@ namespace ps2_syscalls
             {
                 completeClient(base, true);
             };
+            RUNTIME_LOG("[rpc-callback] invocando callback 0x" << std::hex << callbackFunction
+                        << " endParam=0x" << endParameter << " sema=0x" << completionSemaphore
+                        << " sid=0x" << sid << std::dec);
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 
