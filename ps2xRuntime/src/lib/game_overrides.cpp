@@ -33,6 +33,36 @@ namespace
     // 2026-10-09 (Fase 0): probes del init/exit de SIF del juego.
     PS2Runtime::RecompiledFunction g_origCf158 = nullptr;
     PS2Runtime::RecompiledFunction g_origD6380 = nullptr;
+    // 2026-10-16 (v61): para saber si FUN_006e4cc0 entra alguna vez. Es el updater de los
+    // contadores de frame y arranca llamando al constructor de descriptor FUN_006e4848, que
+    // codifica el QWC con (size << 12). Su log vecino [triage-flow] nunca disparo y el unico
+    // kick de DMA de toda la corrida sale vacio (qwc=0): si esta funcion no entra, el juego
+    // nunca construye el descriptor. Estos hooks solo registran entrada y delegan.
+    PS2Runtime::RecompiledFunction g_origE4cc0 = nullptr;
+    PS2Runtime::RecompiledFunction g_origE4848 = nullptr;
+    // 2026-10-16 (v63): el selector de fase REAL (ver work/gemini/README.md §CADENA REAL).
+    // A diferencia de todos los [triage-*], estas son funciones COMPLETAS
+    // (0x51f450-0x51f578 y 0x51f580-0x51fc50) ⇒ replaceFunction SÍ funciona en ellas.
+    PS2Runtime::RecompiledFunction g_orig51f450 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig51f580 = nullptr;
+    // 2026-10-16 (v64): el bucle de frame (FUN_0051fea0, arranca en 0x51FED4) no avanza porque
+    // el Frame 1 nunca termina. FUN_0074a308 recorre una lista enlazada en 0x74a4f0
+    // (lhu $v0,2($a1); bnel $s0,$v0; lw $a1,0xC($a1)). Si el log de ENTRADA aparece y el de
+    // SALIDA no, la funcion nunca retorna: ese es el motivo exacto por el que 0x51FF18 no se
+    // alcanza. NO se puede hookear 0x74a4f0 (direccion interna): se hookea la funcion completa.
+    PS2Runtime::RecompiledFunction g_orig74a308 = nullptr;
+    // 2026-10-16: entrada vs retorno del UPDATE DE FRAME (FUN_00512ab0). Es el que contiene al
+    // selector en su tope y del que cuelga toda la escena. Si entra y no vuelve, el bucle de
+    // frames (FUN_0051fea0, arranca en 0x51FED4) nunca cierra la iteracion y el Frame 2 no empieza.
+    PS2Runtime::RecompiledFunction g_orig512ab0 = nullptr;
+    // 2026-10-17: las cinco llamadas que le quedan al bucle de frame (0x51FED4..0x51FF18) despues
+    // del update. Una de ellas no vuelve, y es la que impide que 0x51FF18 cierre la iteracion.
+    // FUN_00512ab0 ya se probo que SI retorna (ra=0x51fef0).
+    PS2Runtime::RecompiledFunction g_orig512630 = nullptr;   // 0x51fef0 animacion/fisica
+    PS2Runtime::RecompiledFunction g_orig512140 = nullptr;   // 0x51fef8 audio
+    PS2Runtime::RecompiledFunction g_orig513320 = nullptr;   // 0x51ff00 render submit
+    PS2Runtime::RecompiledFunction g_orig51fd90 = nullptr;   // 0x51ff08 frame sync
+    PS2Runtime::RecompiledFunction g_orig51f330 = nullptr;   // 0x51ff10 SIF/IOP poll
     PS2Runtime::RecompiledFunction g_origCf360 = nullptr;
     PS2Runtime::RecompiledFunction g_origCfc60 = nullptr;
     // 2026-10-08 TRIAGE: init del motor de DMA (¿corre en runtime?).
@@ -64,7 +94,34 @@ namespace
             }
             oss << "}";
             {
-                // 2026-10-16: lectura directa de $s7+0x118. En FUN_0074a308 el $s7 es la
+                // 2026-10-16 (v56): contadores del sync de frame del GS que espera el hilo 1.
+            // Si gp+0x638 y gp+0x63c quedan clavados iguales, el runtime no completa ese sync
+            // y la transicion de escena nunca dispara => nadie pide archivos (FUN_00628cc0)
+            // => cola vacia => loader ocioso => listas de geometria vacias => pantalla negra.
+            // gp+0x74 = pedidos en cola; gp+0x80 = slot activo (-1 = ninguno).
+            {
+                const uint32_t gpR = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
+                auto rd4 = [&](uint32_t off) -> uint32_t {
+                    uint32_t v = 0u;
+                    const uint32_t a = (gpR + off) & 0x01FFFFFFu;
+                    if (a + 4u <= 0x02000000u) std::memcpy(&v, rdram + a, 4u);
+                    return v;
+                };
+                oss << " gp54=0x" << std::hex << rd4(0x54u)
+                    << " gp58=0x" << rd4(0x58u)
+                    << " gp5c=0x" << rd4(0x5cu)
+                    << " gp5ec=0x" << rd4(0x5ecu)
+                    << " gp610=0x" << rd4(0x610u)
+                    << " gp614=0x" << rd4(0x614u)
+                    << " gp5dc=0x" << rd4(0x5dcu)
+                    << " gp5e0=0x" << rd4(0x5e0u)
+                    << " gp74=0x" << rd4(0x74u)
+                    << " gp80=0x" << rd4(0x80u)
+                    << " gp638=0x" << rd4(0x638u)
+                    << " gp63c=0x" << rd4(0x63cu)
+                    << " gp640=0x" << rd4(0x640u) << std::dec;
+            }
+            // 2026-10-16: lectura directa de $s7+0x118. En FUN_0074a308 el $s7 es la
             // estructura estatica de BSS 0x00A887B8, asi que 0x118($s7) es la direccion
             // ABSOLUTA 0x00A888D0. Ese slot es el callback que el bucle de polling usa
             // (jalr $v0). Lo puebla el setter FUN_007fe9d0 (sw $a1, 0x118($a0)). Si esta en
@@ -1972,6 +2029,32 @@ namespace
                 std::memcpy(rdram + ((clientPtr + 0x24u) & 0x1FFFFFFFu), &dummyServer, 4); // server
             }
 
+            // FIX 2026-10-16d (v58): el SDK nativo de sceSifBindRpc CREA UN SEMAFORO de
+            // completado y lo guarda en cd->hdr.sema_id (offset 8 del client):
+            //   0x4d7084: jal func_4D32A0   (CreateSema)
+            //   0x4d7090: sw  $v0, 0x8($s1) (cd->hdr.sema_id = id)
+            // Este stub reemplaza esa funcion entera y NO lo hacia: todos los clientes
+            // quedaban con sema_id=-1 (o 0), y por eso ninguna llamada RPC podia senalizar su
+            // completado (y el fallback inventaba un semaforo desde end_para, ya eliminado).
+            // Se replica el comportamiento del SDK: semaforo binario por cliente.
+            if (clientPtr != 0u && (clientPtr + 0x30u) <= 0x02000000u)
+            {
+                // initCount=1 (temporal, NO es lo que dice el SDK).
+                // El SDK nativo crea el semaforo de completitud con init_count=0, max_count=1
+                // (FUN_004d7008: 0x4d7078 sw $v1,0x4($sp)=max; 0x4d7088 sw $zero,0x8($sp)=init).
+                // Con init=0 el juego hace WaitSema y se duerme de verdad, pero el runtime NO
+                // senala el completado de la ruta sid=0x30 (medido: semaId=15 recibio 0 signals,
+                // y con eso el juego sale solo: "Game thread returned. PC=0x74a428"). Con
+                // init=1 el wait no bloquea, el loader completa su ciclo (Estados 1->2->3) y la
+                // inicializacion del streaming termina. Cuando el runtime senale bien el
+                // completado de sid=0x30, volver a init=0 (semantica correcta).
+                const int createdSema = runtime->eeScheduler().createSemaphore(1, 1, 0u, 0u);
+                if (createdSema >= 0)
+                {
+                    const uint32_t semaIdToStore = static_cast<uint32_t>(createdSema);
+                    std::memcpy(rdram + ((clientPtr + 8u) & 0x1FFFFFFFu), &semaIdToStore, 4);
+                }
+            }
             ctx->r[2] = _mm_setzero_si128(); // return 0 (success)
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
@@ -4241,6 +4324,123 @@ namespace
         // fluyendo (390). Iatrogenia REFUTADA: el forzado es necesario
         // (por ahora) y no envenena. Reactivado.
         runtime.replaceFunction(0x6e4d98u, triage6e4d98);
+
+        // 2026-10-16 (v61): hooks de ENTRADA (solo log + delegan en el original).
+        g_origE4cc0 = runtime.lookupFunction(0x6e4cc0u);
+        g_origE4848 = runtime.lookupFunction(0x6e4848u);
+        static auto traceE4cc0wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            RUNTIME_LOG("[hit-6e4cc0] ENTER ra=0x" << std::hex << ra << std::dec);
+            if (g_origE4cc0 != nullptr) g_origE4cc0(rdram, ctx, runtime);
+        };
+        static auto traceE4848wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            RUNTIME_LOG("[hit-6e4848] ENTER");
+            if (g_origE4848 != nullptr) g_origE4848(rdram, ctx, runtime);
+        };
+        if (g_origE4cc0 != nullptr) runtime.replaceFunction(0x6e4cc0u, traceE4cc0wrap);
+        if (g_origE4848 != nullptr) runtime.replaceFunction(0x6e4848u, traceE4848wrap);
+
+        // 2026-10-16 (v63): hooks del selector de fase REAL. Son funciones completas, así que
+        // replaceFunction SÍ aplica (a diferencia de los [triage-*] sobre direcciones internas).
+        g_orig51f450 = runtime.lookupFunction(0x51f450u);
+        g_orig51f580 = runtime.lookupFunction(0x51f580u);
+        static auto trace51f450wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            RUNTIME_LOG("[phase-hook] FUN_0051f450 ENTER ra=0x" << std::hex << ra << std::dec);
+            if (g_orig51f450 != nullptr) g_orig51f450(rdram, ctx, runtime);
+        };
+        static auto trace51f580wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            static uint32_t s_n = 0u;
+            if (++s_n <= 40u || (s_n % 200u) == 0u) {
+                RUNTIME_LOG("[phase-hook] FUN_0051f580 ENTER a0=0x" << std::hex << a0
+                            << " ra=0x" << ra << std::dec << " n=" << s_n);
+            }
+            if (g_orig51f580 != nullptr) g_orig51f580(rdram, ctx, runtime);
+        };
+        if (g_orig51f450 != nullptr) runtime.replaceFunction(0x51f450u, trace51f450wrap);
+        if (g_orig51f580 != nullptr) runtime.replaceFunction(0x51f580u, trace51f580wrap);
+
+        // 2026-10-16 (v64): ENTRADA vs RETORNO de FUN_0074a308. Si entra y no vuelve, el Frame 1
+        // está atrapado en el bucle de lista enlazada de 0x74a4f0 y por eso el bucle de frame
+        // (0x51FED4) nunca cierra la iteración.
+        g_orig74a308 = runtime.lookupFunction(0x74a308u);
+        static auto trace74a308wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            static uint32_t s_n74 = 0u;
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            ++s_n74;
+            RUNTIME_LOG("[frame1] FUN_0074a308 ENTER a0=0x" << std::hex << a0
+                        << " ra=0x" << ra << std::dec << " n=" << s_n74);
+            if (g_orig74a308 != nullptr) g_orig74a308(rdram, ctx, runtime);
+            RUNTIME_LOG("[frame1] FUN_0074a308 RETURN n=" << s_n74);
+        };
+        if (g_orig74a308 != nullptr) runtime.replaceFunction(0x74a308u, trace74a308wrap);
+
+        // 2026-10-16: ENTRADA vs RETORNO del update de frame FUN_00512ab0. Decide si el que no
+        // vuelve es el update (y con el, el bucle de frames) o si el update si retorna y el
+        // problema esta mas adentro.
+        g_orig512ab0 = runtime.lookupFunction(0x512ab0u);
+        static auto trace512ab0wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            static uint32_t s_n51 = 0u;
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            ++s_n51;
+            if (s_n51 <= 20u || (s_n51 % 100u) == 0u) {
+                RUNTIME_LOG("[frame1] FUN_00512ab0 ENTER ra=0x" << std::hex << ra
+                            << std::dec << " n=" << s_n51);
+            }
+            if (g_orig512ab0 != nullptr) g_orig512ab0(rdram, ctx, runtime);
+            if (s_n51 <= 20u || (s_n51 % 100u) == 0u) {
+                RUNTIME_LOG("[frame1] FUN_00512ab0 RETURN n=" << s_n51);
+            }
+        };
+        if (g_orig512ab0 != nullptr) runtime.replaceFunction(0x512ab0u, trace512ab0wrap);
+
+        // 2026-10-17: las cinco llamadas restantes del bucle de frame. Entrada vs retorno: la que
+        // entre y no vuelva es la que impide cerrar la iteracion. Todas son funciones completas.
+        g_orig512630 = runtime.lookupFunction(0x512630u);
+        g_orig512140 = runtime.lookupFunction(0x512140u);
+        g_orig513320 = runtime.lookupFunction(0x513320u);
+        g_orig51fd90 = runtime.lookupFunction(0x51fd90u);
+        g_orig51f330 = runtime.lookupFunction(0x51f330u);
+        // 2026-10-17: el generado hace `return` desde el cuerpo (aristas hacia atras con
+        // eeCheckpointDue) y dispatchGuestBranch devuelve false en el checkpoint previo a una
+        // llamada. En ambos casos ORIG vuelve con la funcion a medias: loguear `raOut` sin
+        // mirar el `pc` al salir confunde un yield con un retorno (y el $ra de un yield es
+        // solo el ultimo `jalr` interno). Por eso se compara pcOut con el retorno esperado.
+#define SWORD_FRAME_CALL_TRACE(NAME, ADDR, EXPECTED_RA, ORIG)                            \
+        static auto trace##NAME##wrap = [](uint8_t *rdram, R5900Context *ctx,           \
+                                           PS2Runtime *runtime) {                        \
+            static uint32_t s_n = 0u;                                                    \
+            static uint32_t s_yields = 0u;                                               \
+            const uint32_t raIn = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));  \
+            const uint32_t pcIn = ctx->pc;                                               \
+            const uint32_t spIn = static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[29]));  \
+            ++s_n;                                                                       \
+            if (s_n <= 8u || (s_n % 100u) == 0u)                                         \
+                RUNTIME_LOG("[frame-loop] " #NAME " ENTER n=" << s_n << " pcIn=0x"       \
+                            << std::hex << pcIn << " raIn=0x" << raIn << " spIn=0x"      \
+                            << spIn << std::dec);                                        \
+            if (ORIG != nullptr) ORIG(rdram, ctx, runtime);                              \
+            const uint32_t raOut = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])); \
+            const uint32_t pcOut = ctx->pc;                                              \
+            const uint32_t spOut = static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[29])); \
+            const bool completed = (pcOut == EXPECTED_RA);                               \
+            if (!completed) ++s_yields;                                                  \
+            if (s_n <= 8u || (s_n % 100u) == 0u || !completed)                           \
+                RUNTIME_LOG("[frame-loop] " #NAME << (completed ? " RETURN" : " YIELD ") \
+                            << " n=" << s_n << " yields=" << s_yields << " pcOut=0x"     \
+                            << std::hex << pcOut << " raOut=0x" << raOut << " spOut=0x"  \
+                            << spOut << " dsp=0x" << (spOut - spIn) << std::dec);        \
+        };                                                                               \
+        if (ORIG != nullptr) runtime.replaceFunction(ADDR, trace##NAME##wrap)
+        SWORD_FRAME_CALL_TRACE(f512630, 0x512630u, 0x51fef8u, g_orig512630);
+        SWORD_FRAME_CALL_TRACE(f512140, 0x512140u, 0x51ff00u, g_orig512140);
+        SWORD_FRAME_CALL_TRACE(f513320, 0x513320u, 0x51ff08u, g_orig513320);
+        SWORD_FRAME_CALL_TRACE(f51fd90, 0x51fd90u, 0x51ff10u, g_orig51fd90);
+        SWORD_FRAME_CALL_TRACE(f51f330, 0x51f330u, 0x51ff18u, g_orig51f330);
+#undef SWORD_FRAME_CALL_TRACE
 
         // 2026-10-06z: registrar flips reales en 0x6e4e1c (sb $v0, 0x604($gp))
         static auto triageFlipLog = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
