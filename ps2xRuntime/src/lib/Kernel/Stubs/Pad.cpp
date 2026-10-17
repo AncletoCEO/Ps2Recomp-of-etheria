@@ -470,6 +470,22 @@ namespace ps2_stubs
                 state = kPadStateStable;
             }
         }
+        // 2026-10-17: el juego espera el pad "ready" para pasar de la tarea 3 a la 4 (la que dibuja el
+        // menu). Loguea que nos pide y que devolvemos (dedup por combinacion).
+        {
+            static uint32_t s_lastPadGetState = 0xFFFFFFFFu;
+            static uint64_t s_padGetStateCalls = 0;
+            const uint32_t port = getRegU32(ctx, 4);
+            const uint32_t slot = getRegU32(ctx, 5);
+            const uint32_t key = (port << 16) | (slot << 8) | (static_cast<uint32_t>(state) & 0xFFu);
+            ++s_padGetStateCalls;
+            if (key != s_lastPadGetState) {
+                s_lastPadGetState = key;
+                RUNTIME_LOG("[pad-getstate] port=" << port << " slot=" << slot
+                            << " open=" << ((portState && portState->open) ? 1 : 0)
+                            << " state=" << state << " n=" << s_padGetStateCalls);
+            }
+        }
         setReturnS32(ctx, state);
     }
 
