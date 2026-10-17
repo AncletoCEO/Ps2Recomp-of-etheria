@@ -1957,9 +1957,17 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     s_presentLogCount++;
     if (s_presentLogCount < 10 || (s_presentLogCount % 10) == 0)
     {
+        // 2026-10-17: ademas del total, histograma de VRAM por cuarto de MB (16 buckets de 256 KB) y
+        // los fbp de display y del contexto de dibujo. Hace falta para responder "donde esta el
+        // contenido": con vramNonZero=475456 el diag dice `crt1 (fbp=0): rgbNZ=0` => se presenta una
+        // pagina vacia mientras hay data en otra.
         uint32_t totalNonZero = 0;
+        uint32_t bucket[16] = {0};
         for (size_t i = 0; i < m_vramSize; ++i) {
-            if (m_vram[i] != 0) totalNonZero++;
+            if (m_vram[i] != 0) {
+                totalNonZero++;
+                bucket[(i >> 18) & 0xFu]++;
+            }
         }
         std::cout << "[gs:present] #" << s_presentLogCount
                   << " valid1=" << valid1 << " valid2=" << valid2
@@ -1968,8 +1976,17 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                   << " display1=0x" << request.display1
                   << " dispfb2=0x" << request.dispfb2
                   << " display2=0x" << request.display2
-                  << " vramNonZero=" << std::dec << totalNonZero << "/" << m_vramSize
-                  << std::endl;
+                  << std::dec << " vramNonZero=" << totalNonZero << "/" << m_vramSize
+                  << " fbpDisp1=" << displayFrame1.fbp << " fbw1=" << displayFrame1.fbw
+                  << " psm1=" << static_cast<uint32_t>(displayFrame1.psm)
+                  << " fbpDisp2=" << displayFrame2.fbp << " ctx=";
+        for (const GSFrameReg &cf : request.contextFrames)
+            std::cout << std::hex << cf.fbp << std::dec << "/" << cf.fbw << "/" << static_cast<uint32_t>(cf.psm) << " ";
+        std::cout << " per256K=";
+        for (uint32_t b = 0; b < 16u; ++b)
+            if (bucket[b] != 0u)
+                std::cout << "[" << b << "]=" << bucket[b] << " ";
+        std::cout << std::endl;
     }
     if (!valid1 && !valid2)
         return result;

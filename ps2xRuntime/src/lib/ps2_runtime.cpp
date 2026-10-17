@@ -2484,6 +2484,12 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 // 2026-10-10 DIAG render: último pc guest que hizo un Store (para atribuir los paquetes/prims GS).
 uint32_t g_lastStorePc = 0u;
 
+// 2026-10-17 DIAG fase: objeto de fase (a0 de FUN_00512630, el que devuelve 0x513370 en el bucle de
+// frame). Su flag en +8 gobierna el lazo `0x512674..0x512a6c` (`lw $v1,0x8($s1); beqz`): mientras
+// valga != 0 el lazo no sale y el bucle de frame no itera (la fase nunca avanza al menu, gp740=0).
+// Lo setea el propio FUN_00512630 (0x51297c) y lo tiene que limpiar el que completa el trabajo.
+uint32_t g_phaseObjectAddr = 0u;
+
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
     g_lastStorePc = ctx ? ctx->pc : 0u;
@@ -2522,6 +2528,19 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
                         << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
                         << std::dec << " n=" << s_vif1Kick
                         << " withData=" << s_vif1KickWithData);
+        }
+    }
+    // 2026-10-17: vigila el flag +8 del objeto de fase (ver g_phaseObjectAddr). Quien lo ponga en 0
+    // es el que cierra el lazo de fase; si nadie lo escribe, ese es el bloqueo de la fase.
+    if (g_phaseObjectAddr != 0u && vaddr == (g_phaseObjectAddr + 8u))
+    {
+        static uint64_t s_phaseFlagLogs = 0;
+        if (s_phaseFlagLogs < 120ull)
+        {
+            ++s_phaseFlagLogs;
+            RUNTIME_LOG("[phase-flag] val=" << value << " pc=0x" << std::hex << ctx->pc
+                        << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                        << " obj=0x" << g_phaseObjectAddr << std::dec << " n=" << s_phaseFlagLogs);
         }
     }
     // 2026-10-17: auditoria de registros de canal DMA (0x10008000-0x1000AFFF): quien escribe

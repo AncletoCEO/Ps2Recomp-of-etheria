@@ -19,6 +19,10 @@
 #include <vector>
 #include "sword_etheria_return_stubs.h"
 
+// 2026-10-17 DIAG fase: definido en ps2_runtime.cpp (fuera del namespace anonimo, para que el
+// wrapper del bucle de frame pueda publicar ahi el objeto de fase y Store32 vigilar su flag +8).
+extern uint32_t g_phaseObjectAddr;
+
 namespace
 {
     // 2026-10-07g: wrap del original de 6e4848 (file-scope: las lambdas de
@@ -4417,11 +4421,13 @@ namespace
             const uint32_t raIn = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));  \
             const uint32_t pcIn = ctx->pc;                                               \
             const uint32_t spIn = static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[29]));  \
+            const uint32_t a0In = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));   \
+            g_phaseObjectAddr = a0In;                                                     \
             ++s_n;                                                                       \
             if (s_n <= 8u || (s_n % 100u) == 0u)                                         \
                 RUNTIME_LOG("[frame-loop] " #NAME " ENTER n=" << s_n << " pcIn=0x"       \
                             << std::hex << pcIn << " raIn=0x" << raIn << " spIn=0x"      \
-                            << spIn << std::dec);                                        \
+                            << spIn << " a0In=0x" << a0In << std::dec);                  \
             if (ORIG != nullptr) ORIG(rdram, ctx, runtime);                              \
             const uint32_t raOut = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])); \
             const uint32_t pcOut = ctx->pc;                                              \
@@ -5740,6 +5746,19 @@ namespace
             static uint64_t s_lastCycle = 0ull;
             static uint64_t s_lastVsync = 0ull;
             static uint32_t s_lastFrame = 0u;
+            // 2026-10-17: el lazo de fase de FUN_00512630 sale cuando `FUN_00510EF0(*(gp-0x324)) != 0`
+            // (arista 0x5127ac -> 0x512978 -> flag*(s1+8)=1). Esa funcion es un getter:
+            //   return (*(obj+0) != 0) ? 0 : *(obj+0xC)
+            // Se loguean ptr/+0/+0xC: es la condicion concreta que el juego esta esperando.
+            uint32_t phasePtr = 0u, phaseF0 = 0u, phaseFC = 0u;
+            {
+                const uint32_t gpD = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
+                std::memcpy(&phasePtr, rdram + ((gpD - 0x324u) & 0x01FFFFFFu), 4);
+                if (phasePtr != 0u) {
+                    std::memcpy(&phaseF0, rdram + ((phasePtr & 0x01FFFFFFu) + 0u), 4);
+                    std::memcpy(&phaseFC, rdram + ((phasePtr & 0x01FFFFFFu) + 0xCu), 4);
+                }
+            }
             if (runtime != nullptr && (s_frameCounter <= 3u || (s_frameCounter % 10u) == 0u)) {
                 const EeKernelSnapshot snap = runtime->eeScheduler().snapshot();
                 const uint64_t vs = runtime->eeScheduler().currentVSyncTick();
@@ -5750,7 +5769,14 @@ namespace
                     << " dCycle=" << (snap.eeCycle - s_lastCycle)
                     << " cycPerTick=" << ((snap.eeCycle - s_lastCycle) / dTick)
                     << " vsync=" << vs << " dVsync=" << (vs - s_lastVsync)
-                    << " run=" << snap.runningThreadId;
+                    << " run=" << snap.runningThreadId
+                    // 2026-10-17: como ENTRA el tick: ra del llamador (0 = invocacion del scheduler,
+                    // p.ej. callback de VSync/RPC) y sp. El tick corre a ~9/s: hay que saber quien lo llama.
+                    << " ra=0x" << std::hex
+                    << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                    << " sp=0x" << static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[29]))
+                    << " phP=0x" << phasePtr << " ph0=0x" << phaseF0 << " phC=0x" << phaseFC
+                    << std::dec;
                 for (const EeThreadSnapshot &t : snap.threads) {
                     oss << " [id=" << t.id << " pc=0x" << std::hex << t.pc << " ra=0x" << t.ra
                         << std::dec << " st=" << static_cast<int>(t.status)

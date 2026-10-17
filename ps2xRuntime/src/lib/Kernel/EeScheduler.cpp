@@ -2007,6 +2007,14 @@ void EeScheduler::processEvent(const EeEvent &event)
         completeVSync(m_vsyncTick);
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {
+            // 2026-10-17: el runtime encola este callback por VBlank (60 Hz). El tick del juego
+            // (0x50f750) corre a ~9/s: hay que saber si el callback se invoca de verdad y con que pc.
+            static uint64_t s_gsCbCount = 0;
+            if ((++s_gsCbCount % 120ull) == 1ull)
+            {
+                RUNTIME_LOG("[gs-cb] n=" << s_gsCbCount << " pc=0x" << std::hex << m_gsVSyncCallback
+                                         << " vsync=" << std::dec << m_vsyncTick);
+            }
             GuestInvocation invocation{};
             invocation.kind = GuestInvocationKind::GsCallback;
             invocation.context.pc = m_gsVSyncCallback;
