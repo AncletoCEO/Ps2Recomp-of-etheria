@@ -548,8 +548,16 @@ bool PS2Memory::initialize(size_t ramSize)
         std::memset(m_rdram, 0, ramSize);
 #if defined(__linux__)
         // SWORD_WP_WRITER=1: hook de escritores a 0xC80000-0xE50000 (lead HANDOFF).
-        if (std::getenv("SWORD_WP_WRITER") != nullptr)
-            wpInstall(m_rdram, 0x00C80000u, 0x00E50000u);
+        // SWORD_WP_WRITER=<lo>-<hi> (hex): rango a vigilar (2026-10-17, para cazar quien escribe
+        // el centinela de la lista del gestor de texturas en 0xA88874).
+        if (const char *wp = std::getenv("SWORD_WP_WRITER"); wp != nullptr)
+        {
+            unsigned long wlo = 0ul, whi = 0ul;
+            if (std::sscanf(wp, "%lx-%lx", &wlo, &whi) == 2 && whi > wlo)
+                wpInstall(m_rdram, static_cast<uint32_t>(wlo), static_cast<uint32_t>(whi));
+            else
+                wpInstall(m_rdram, 0x00C80000u, 0x00E50000u);
+        }
 #endif
 
         // Allocate scratchpad
