@@ -2365,6 +2365,28 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     };
 
     DmaTagView setupTag{};
+    // DIAG 2026-10-17: forma de la cadena que manda el juego (para saber por que no entra como IMAGE).
+    {
+        static uint64_t s_imgN = 0;
+        DmaTagView t0{};
+        const bool ok0 = loadDmaTagAt(tadr, t0);
+        uint64_t gifLo = 0, gifHi = 0;
+        const uint8_t *p = nullptr;
+        if (resolveContiguous(tadr + 16u, 16u, p))
+        {
+            gifLo = loadScalar<uint64_t>(p, 0u, 16u, "diag gif tag lo", tadr + 16u);
+            gifHi = loadScalar<uint64_t>(p, 8u, 16u, "diag gif tag hi", tadr + 16u);
+        }
+        if ((++s_imgN % 20ull) == 1ull)
+        {
+            RUNTIME_LOG("[gif-img] n=" << s_imgN << " tadr=0x" << std::hex << tadr << " chcr=0x" << chcr
+                        << " tag0(id=" << std::dec << t0.id << " qwc=" << t0.qwc << " irq=" << (t0.irq ? 1 : 0)
+                        << " addr=0x" << std::hex << t0.addr << " upper=0x" << t0.upper << ")"
+                        << " gif(lo=0x" << gifLo << " hi=0x" << gifHi << ")"
+                        << " flg=" << std::dec << gifTagFlg(gifLo) << " nloop=" << gifTagNloop(gifLo));
+        }
+        (void)ok0;
+    }
     if (!loadDmaTagAt(tadr, setupTag) ||
         setupTag.id != 1u ||
         setupTag.qwc != 5u ||

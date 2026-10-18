@@ -2663,15 +2663,30 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+    // DIAG 2026-10-17: que camino de la cadena GIF gana (imagen / packed / fallback generico).
     {
-        drainCompletedDmacHandlers(rdram);
-        return;
-    }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
-    {
-        drainCompletedDmacHandlers(rdram);
-        return;
+        static uint64_t s_gifN = 0;
+        const bool img = m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr);
+        if (img)
+        {
+            if ((++s_gifN % 20ull) == 1ull)
+                RUNTIME_LOG("[gif-chain] n=" << s_gifN << " IMAGE ok tadr=0x" << std::hex << tadr
+                                             << " chcr=0x" << chcr << std::dec);
+            drainCompletedDmacHandlers(rdram);
+            return;
+        }
+        const bool packed = m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr);
+        if (packed)
+        {
+            if ((++s_gifN % 20ull) == 1ull)
+                RUNTIME_LOG("[gif-chain] n=" << s_gifN << " PACKED ok tadr=0x" << std::hex << tadr
+                                             << " chcr=0x" << chcr << std::dec);
+            drainCompletedDmacHandlers(rdram);
+            return;
+        }
+        if ((++s_gifN % 20ull) == 1ull)
+            RUNTIME_LOG("[gif-chain] n=" << s_gifN << " FALLBACK generico tadr=0x" << std::hex << tadr
+                                         << " chcr=0x" << chcr << std::dec);
     }
     m_memory.writeIORegister(GIF_CHCR, chcr);
     m_memory.processPendingTransfers();
