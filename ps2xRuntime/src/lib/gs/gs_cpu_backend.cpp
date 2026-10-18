@@ -1851,12 +1851,14 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
     if (const char *vp = std::getenv("SWORD_DUMP_VRAM"); vp != nullptr && *vp != '\0')
     {
         static uint32_t s_presentN = 0u;
-        if (++s_presentN == 1500u)
+        const uint32_t n = ++s_presentN;
+        if (n == 300u || n == 900u || n == 1500u)
         {
-            std::ofstream out("/tmp/recomp_vram.bin", std::ios::binary);
+            const std::string path = std::strcmp(vp, "1") == 0 ? std::string("/tmp/recomp_vram.bin") : std::string(vp);
+            std::ofstream out(path, std::ios::binary);
             if (out && m_vram != nullptr && m_vramSize != 0u)
                 out.write(reinterpret_cast<const char *>(m_vram), m_vramSize);
-            std::cout << "[dump-vram] n=" << s_presentN << " size=" << m_vramSize << std::endl;
+            std::cout << "[dump-vram] present=" << n << " size=" << m_vramSize << " path=" << path << std::endl;
         }
     }
 
@@ -1951,7 +1953,9 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
     decodeDisplaySize(request.display1, width1, height1);
     decodeDisplaySize(request.display2, width2, height2);
-    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1) &&
+                        !(std::getenv("SWORD_NO_CRT1_DEFAULT") != nullptr &&
+                          request.dispfb1 == ((0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43)));
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     static uint32_t s_presentLogCount = 0;
     s_presentLogCount++;
