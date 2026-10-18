@@ -1430,6 +1430,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " src=0x" << std::hex << sourcePc << " tgt=0x" << targetPc
                       << " kind=" << static_cast<int>(kind)
                       << " a0=0x" << a0 << " a1=0x" << a1 << std::dec << "\n";
+                // DIAG 2026-10-17: sin esto, un trace de pocas lineas queda VACIO en disco porque el
+                // buffer del ofstream no se vacia (nos costo una conclusion falsa).
+                s_out.flush();
             }
         }
     }
