@@ -1079,6 +1079,27 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    // DIAG 2026-10-17: conjunto de registros GS que el juego escribe por paquetes A+D, deduplicado por
+    // (reg,valor). Sirve para responder dos cosas de una: si intenta subir texturas (BITBLTBUF=0x50,
+    // TRXPOS=0x51, TRXREG=0x52, TRXDIR=0x53, HWREG=0x54) y si hace el flip (DISPFB1/DISPLAY1, 0x59/0x5a).
+    {
+        static uint64_t s_regLogs = 0;
+        struct Seen { uint64_t key; };
+        static std::vector<uint64_t> s_seen;
+        const uint64_t key = (static_cast<uint64_t>(regAddr) << 56) ^ (value & 0x00FFFFFFFFFFFFFFull);
+        bool known = false;
+        for (const uint64_t k : s_seen)
+        {
+            if (k == key) { known = true; break; }
+        }
+        if (!known && s_regLogs < 200ull)
+        {
+            s_seen.push_back(key);
+            ++s_regLogs;
+            RUNTIME_LOG("[gs-reg] n=" << s_regLogs << " reg=0x" << std::hex
+                        << static_cast<uint32_t>(regAddr) << " val=0x" << value << std::dec);
+        }
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1409,6 +1430,23 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+
+        // DIAG 2026-10-17: TODA subida (TRXDIR) con su destino/formato y tamaño, para comparar contra lo
+        // que muestrean los draws (tbp0/psm) y ver que texturas faltan.
+        {
+            static uint64_t s_trxN = 0;
+            if (s_trxN < 60ull)
+            {
+                ++s_trxN;
+                RUNTIME_LOG("[gs-upload] n=" << s_trxN << " dir=" << m_trxdir
+                            << " sbp=" << m_bitbltbuf.sbp << " sbw=" << m_bitbltbuf.sbw
+                            << " spsm=" << static_cast<uint32_t>(m_bitbltbuf.spsm)
+                            << " dbp=" << m_bitbltbuf.dbp << " dbw=" << m_bitbltbuf.dbw
+                            << " dpsm=" << static_cast<uint32_t>(m_bitbltbuf.dpsm)
+                            << " rrw=" << m_trxreg.rrw << " rrh=" << m_trxreg.rrh
+                            << " dsax=" << m_trxpos.dsax << " dsay=" << m_trxpos.dsay);
+            }
+        }
 
         if (m_backend)
         {
