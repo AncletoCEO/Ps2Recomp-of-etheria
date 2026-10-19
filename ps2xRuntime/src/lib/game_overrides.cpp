@@ -76,6 +76,10 @@ namespace
     PS2Runtime::RecompiledFunction g_orig4d1a60 = nullptr;
     PS2Runtime::RecompiledFunction g_orig6efd28 = nullptr;
     PS2Runtime::RecompiledFunction g_orig50f750 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig6db0d0 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig6d6a80 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig6d6290 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig6d51b0 = nullptr;
     void triageLoadGs(PS2Runtime *runtime);
     void triage6e45d8wrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -4435,6 +4439,105 @@ namespace
         };
         if (g_orig74a308 != nullptr) runtime.replaceFunction(0x74a308u, trace74a308wrap);
 
+        // 2026-10-19: Pad hook durable para FUN_0051c7c0 (PadRead / thunk_FUN_0051e700).
+        // En el ELF original es 'j 0x51e700; nop'. Reemplaza al thunk gitignored para ser durable.
+        static auto padHook51c7c0 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t port = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4])); // $a0
+            uint16_t buttons = 0;
+
+            if (runtime && port == 0) {
+                uint8_t padData[32]{};
+                if (runtime->padBackend().readState(0, 0, padData, sizeof(padData))) {
+                    const uint16_t ps2Raw = static_cast<uint16_t>(padData[2] | (padData[3] << 8));
+                    if (!(ps2Raw & 0x0010)) buttons |= 0x8000; // UP
+                    if (!(ps2Raw & 0x0040)) buttons |= 0x2000; // DOWN
+                    if (!(ps2Raw & 0x0080)) buttons |= 0x0002; // LEFT
+                    if (!(ps2Raw & 0x0020)) buttons |= 0x0008; // RIGHT
+                    if (!(ps2Raw & 0x4000)) buttons |= 0x0040; // CROSS
+                    if (!(ps2Raw & 0x2000)) buttons |= 0x0020; // CIRCLE
+                    if (!(ps2Raw & 0x8000)) buttons |= 0x4000; // SQUARE
+                    if (!(ps2Raw & 0x1000)) buttons |= 0x1000; // TRIANGLE
+                    if (!(ps2Raw & 0x0008)) buttons |= 0x0004; // START
+                    if (!(ps2Raw & 0x0001)) buttons |= 0x0001; // SELECT
+                    if (!(ps2Raw & 0x0400)) buttons |= 0x0100; // L1
+                    if (!(ps2Raw & 0x0800)) buttons |= 0x0800; // R1
+                    if (!(ps2Raw & 0x0100)) buttons |= 0x0200; // L2
+                    if (!(ps2Raw & 0x0200)) buttons |= 0x0400; // R2
+                }
+
+                static uint16_t s_lastButtons = 0;
+                if (buttons != s_lastButtons) {
+                    std::cout << "[pad-host] port=0 buttons=0x" << std::hex << buttons
+                              << (buttons & 0x0040 ? " [CROSS]" : "")
+                              << (buttons & 0x0020 ? " [CIRCLE]" : "")
+                              << (buttons & 0x4000 ? " [SQUARE]" : "")
+                              << (buttons & 0x1000 ? " [TRIANGLE]" : "")
+                              << (buttons & 0x8000 ? " [UP]" : "")
+                              << (buttons & 0x2000 ? " [DOWN]" : "")
+                              << (buttons & 0x0002 ? " [LEFT]" : "")
+                              << (buttons & 0x0008 ? " [RIGHT]" : "")
+                              << (buttons & 0x0004 ? " [START]" : "")
+                              << (buttons & 0x0001 ? " [SELECT]" : "")
+                              << std::dec << std::endl;
+                    s_lastButtons = buttons;
+                }
+            }
+
+            if (rdram) {
+                uint32_t bufBase = 0u;
+                std::memcpy(&bufBase, rdram + 0x00A42500u, 4);
+                if (bufBase != 0u && (bufBase + port * 512u + 2u) < 32u * 1024u * 1024u) {
+                    std::memcpy(rdram + bufBase + port * 512u + 2u, &buttons, 2);
+                } else if ((0x00A42102u + port * 512u) < 32u * 1024u * 1024u) {
+                    std::memcpy(rdram + 0x00A42102u + port * 512u, &buttons, 2);
+                }
+            }
+
+            ctx->r[2] = _mm_set_epi64x(0, static_cast<int64_t>(buttons)); // $v0
+            const uint32_t returnAddress = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            ctx->pc = returnAddress;
+        };
+        runtime.replaceFunction(0x51c7c0u, padHook51c7c0);
+
+        // 2026-10-19: UI probes para diagnosticar la lista 0xA88874 (ClearAll vs Inserts)
+        g_orig6db0d0 = runtime.lookupFunction(0x6db0d0u);
+        static auto trace6db0d0wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            RUNTIME_LOG("[ui-clear] UI_Manager::ClearAll ENTER ra=0x" << std::hex << ra << std::dec);
+            if (g_orig6db0d0 != nullptr) g_orig6db0d0(rdram, ctx, runtime);
+        };
+        if (g_orig6db0d0 != nullptr) runtime.replaceFunction(0x6db0d0u, trace6db0d0wrap);
+
+        g_orig6d6a80 = runtime.lookupFunction(0x6d6a80u);
+        static auto trace6d6a80wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+            const uint32_t a2 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            RUNTIME_LOG("[ui-insert] 0x6d6a80 mgr=0x" << std::hex << a0 << " node=0x" << a1
+                        << " widget=0x" << a2 << " ra=0x" << ra << std::dec);
+            if (g_orig6d6a80 != nullptr) g_orig6d6a80(rdram, ctx, runtime);
+        };
+        if (g_orig6d6a80 != nullptr) runtime.replaceFunction(0x6d6a80u, trace6d6a80wrap);
+
+        g_orig6d6290 = runtime.lookupFunction(0x6d6290u);
+        static auto trace6d6290wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            RUNTIME_LOG("[ui-insert] 0x6d6290 a0=0x" << std::hex << a0 << " ra=0x" << ra << std::dec);
+            if (g_orig6d6290 != nullptr) g_orig6d6290(rdram, ctx, runtime);
+        };
+        if (g_orig6d6290 != nullptr) runtime.replaceFunction(0x6d6290u, trace6d6290wrap);
+
+        g_orig6d51b0 = runtime.lookupFunction(0x6d51b0u);
+        static auto trace6d51b0wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            RUNTIME_LOG("[ui-reset] FUN_006d51b0 ENTER a0=0x" << std::hex << a0 << " ra=0x" << ra << std::dec);
+            if (g_orig6d51b0 != nullptr) g_orig6d51b0(rdram, ctx, runtime);
+        };
+        if (g_orig6d51b0 != nullptr) runtime.replaceFunction(0x6d51b0u, trace6d51b0wrap);
+
         // 2026-10-16: ENTRADA vs RETORNO del update de frame FUN_00512ab0. Decide si el que no
         // vuelve es el update (y con el, el bucle de frames) o si el update si retorna y el
         // problema esta mas adentro.
@@ -5865,13 +5968,44 @@ namespace
                         << " wr=" << static_cast<int>(t.waitReason) << " wid=" << t.waitId << "]";
                 }
                 RUNTIME_LOG(oss.str());
+                // 2026-10-17: fade. *(gp-0x33C) = objeto del motor; su +8 es el valor que el virtual
+                // +0x30 (hoja 0x591b90, "*(a0+8) += min(delta,0.25)") avanza con f12 = *(gp-0x320).
+                // En el menu real vale 3.115 (fade terminado, >1); si en nuestro run queda ~0, el fade
+                // cubre el menu (el frame presentado es un quad negro con alpha).
+                uint32_t fadeEng = 0u, fadeVal = 0u, fadeRate = 0u;
+                const uint32_t gpF = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
+                std::memcpy(&fadeEng, rdram + ((gpF - 0x33Cu) & 0x01FFFFFFu), 4);
+                std::memcpy(&fadeRate, rdram + ((gpF - 0x320u) & 0x01FFFFFFu), 4);
+                if (fadeEng != 0u)
+                    std::memcpy(&fadeVal, rdram + ((fadeEng & 0x01FFFFFFu) + 8u), 4);
+                // 2026-10-19 (hito "ver el selector"): la lista de objetos de UI tiene su centinela en
+                // 0xA88874 (next=+0, prev=+4). En el savestate real: next=0xCB5818, prev=0xE8C058 (6
+                // objetos). Si en nuestro run el centinela se auto-apunta, la lista esta vacia y
+                // FUN_0083d290 itera 0 elementos => solo se dibuja el velo (aNZ>0, rgbNZ=0).
+                uint32_t uiNext = 0u, uiCount = 0u;
+                std::memcpy(&uiNext, rdram + 0x00A88874u, 4);
+                for (uint32_t p = uiNext; p != 0x00A88874u && uiCount < 16u; ++uiCount) {
+                    uint32_t n = 0u;
+                    std::memcpy(&n, rdram + (p & 0x01FFFFFFu), 4);
+                    if (n == p || (n & 0x01FFFFFFu) == 0u) break;
+                    p = n;
+                }
+                uint32_t t3_7c = 0u, t3_84 = 0u;
+                if (tT3 != 0u && (tT3 + 0x200u + 0x88u) < 32u * 1024u * 1024u) {
+                    std::memcpy(&t3_7c, rdram + tT3 + 0x200u + 0x7cu, 4);
+                    std::memcpy(&t3_84, rdram + tT3 + 0x200u + 0x84u, 4);
+                }
                 RUNTIME_LOG("[task] f=" << s_frameCounter
                             << " mgr=0x" << std::hex << tMgr << " root=0x" << tRoot
                             << " h20=0x" << tRootH20 << std::dec << " sub=" << tRootSub
                             << " t3=0x" << std::hex << tT3 << std::dec << " t3st=" << tT3St
                             << " t3sub=" << tT3Sub
+                            << " t3_7c=0x" << std::hex << t3_7c << " t3_84=0x" << t3_84 << std::dec
                             << " ldId=0x" << std::hex << tEntryId << std::dec
-                            << " ldSt=" << tEntryState);
+                            << " ldSt=" << tEntryState
+                            << " fadeEng=0x" << std::hex << fadeEng << " fadeVal=0x" << fadeVal
+                            << " rate=0x" << fadeRate << std::dec
+                            << " uiNext=0x" << std::hex << uiNext << " uiCount=" << uiCount << std::dec);
                 s_lastCycle = snap.eeCycle;
                 s_lastVsync = vs;
                 s_lastFrame = s_frameCounter;
