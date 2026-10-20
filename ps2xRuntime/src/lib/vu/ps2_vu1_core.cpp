@@ -1671,19 +1671,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     // 2026-10-10 DIAG: dump de la micro-memoria (código) y data de la VU1 para desensamblar.
     {
-        static bool s_dumped = false;
-        if (!s_dumped && std::getenv("SWORD_DUMP_VU1CODE") != nullptr)
+        uint32_t firstWord = 0u;
+        if (vuCode != nullptr && codeSize >= 4u)
+            std::memcpy(&firstWord, vuCode, 4u);
+        // 2026-10-19 (hito 1.3): el primer run trae el microprograma de boot (0xf0072e10...).
+        // El del selector se sube despues por MPG #2 y empieza con 0x01ff03f3 (verificado contra
+        // work/pcsx2_states/videoformat_menu.p2s: vu1MicroMem.bin). Dump solo cuando coincida.
+        // 2026-10-20 (hito 1.6): dump en el run 1 y en el 100 para distinguir upload incompleto
+        // de microcodigo distinto.
+        static uint32_t s_selectorRuns = 0u;
+        if (std::getenv("SWORD_DUMP_VU1CODE") != nullptr && firstWord == 0x01ff03f3u)
         {
-            s_dumped = true;
-            if (FILE *f = std::fopen("/tmp/recomp_vu1code.bin", "wb"))
+            ++s_selectorRuns;
+            if (s_selectorRuns == 1u || s_selectorRuns == 100u)
             {
-                std::fwrite(vuCode, 1, codeSize, f);
-                std::fclose(f);
-            }
-            if (FILE *f = std::fopen("/tmp/recomp_vu1data.bin", "wb"))
-            {
-                std::fwrite(vuData, 1, dataSize, f);
-                std::fclose(f);
+                const std::string suffix = "_run" + std::to_string(s_selectorRuns);
+                if (FILE *f = std::fopen(("/tmp/recomp_vu1code" + suffix + ".bin").c_str(), "wb"))
+                {
+                    std::fwrite(vuCode, 1, codeSize, f);
+                    std::fclose(f);
+                }
+                if (FILE *f = std::fopen(("/tmp/recomp_vu1data" + suffix + ".bin").c_str(), "wb"))
+                {
+                    std::fwrite(vuData, 1, dataSize, f);
+                    std::fclose(f);
+                }
             }
         }
     }

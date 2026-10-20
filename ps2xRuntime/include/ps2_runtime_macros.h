@@ -726,7 +726,8 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
 #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
 #define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
+// MMI PEXEW: rd = (rt2, rt1, rt0, rt3); PCSX2 recPEXEW uses PSHUF.D 0xc6.
+#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 1, 2))
 #define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
 
 // Additional VU0 operations

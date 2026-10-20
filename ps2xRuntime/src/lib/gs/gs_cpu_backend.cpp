@@ -15,8 +15,13 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 
 using namespace GSInternal;
+
+// 2026-10-19 (hito 1.2): definidos en game_overrides.cpp; callback/widget de UI en ejecucion.
+extern uint32_t g_swordUiCbTag;
+extern uint32_t g_swordUiCurWidget;
 
 namespace
 {
@@ -125,6 +130,10 @@ namespace
 
     bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
     {
+        // DIAG 2026-10-18 (Gemini v71 paso 2): bypass del alpha test para probar que la geometria
+        // escribe en VRAM si no se descarta. Env-gated, default OFF.
+        if (std::getenv("SWORD_NO_ALPHA_TEST") != nullptr)
+            return true;
         if ((testReg & 0x1u) == 0u)
             return true;
 
@@ -236,6 +245,37 @@ namespace
                                         uint8_t tb,
                                         uint8_t ta)
     {
+        // DIAG 2026-10-18 (Gemini v77): si el vertice viene RGB=0, MODULATE anula el texel.
+        // Con SWORD_FORCE_VTX_RGB=1 se usa 1.0 (128) para los draws de UI (tbp0 >= 10240).
+        if (std::getenv("SWORD_FORCE_VTX_RGB") != nullptr && tex.tbp0 >= 10240u &&
+            vr == 0u && vg == 0u && vb == 0u)
+        {
+            vr = 128u;
+            vg = 128u;
+            vb = 128u;
+        }
+        // DIAG 2026-10-18 (Gemini v79): la CLUT del atlas (cbp=10300) tiene valores 4-bit
+        // (A y RGB <= 15). Con SWORD_UI_COLOR_FIX=1 se expanden a escala GS para ver si el texto
+        // aparece. NO es fix real.
+        if (std::getenv("SWORD_UI_COLOR_FIX") != nullptr && tex.tbp0 >= 10240u)
+        {
+            if (ta > 0u && ta <= 15u)
+                ta = static_cast<uint8_t>((static_cast<uint32_t>(ta) * 128u + 7u) / 15u);
+            if (tr <= 15u)
+                tr = static_cast<uint8_t>(tr * 17u);
+            if (tg <= 15u)
+                tg = static_cast<uint8_t>(tg * 17u);
+            if (tb <= 15u)
+                tb = static_cast<uint8_t>(tb * 17u);
+            if (vr == 0u && vg == 0u && vb == 0u)
+            {
+                vr = 128u;
+                vg = 128u;
+                vb = 128u;
+            }
+            if (va == 0u)
+                va = 128u;
+        }
         const bool textureHasAlpha = tex.tcc != 0u;
         TextureCombineResult out{tr, tg, tb, textureHasAlpha ? ta : va};
 
@@ -558,6 +598,13 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
 
+    // DIAG 2026-10-18 (Gemini v76): con SWORD_CLUT_RELOAD=1 se recarga la paleta en CADA escritura de
+    // TEX0, ignorando el cache m_clutCbp (que no se invalida en las subidas a VRAM).
+    if (std::getenv("SWORD_CLUT_RELOAD") != nullptr)
+    {
+        LoadClutUnlocked(tex0, texclut);
+        return;
+    }
     switch (tex0.cld)
     {
     case 0u:
@@ -634,6 +681,15 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
+    }
+
+    // DIAG 2026-10-18 (Gemini v77): verificar que la recarga lee la paleta correcta de VRAM.
+    {
+        static uint32_t s_clLoadLog = 0u;
+        if (s_clLoadLog++ < 8u)
+            std::cout << "[clut-load] cbp=" << tex0.cbp << " vram=0x" << std::hex << (tex0.cbp * 256u)
+                      << " e1=0x" << ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, 1u, 1u, 0u)
+                      << std::dec << std::endl;
     }
 }
 
@@ -713,6 +769,52 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    // 2026-10-19 (hito 1.2): prims emitidos por el callback de render en ejecucion (tag en
+    // game_overrides.cpp). Env: SWORD_UI_CB_PRIMS=1 (OFF por defecto).
+    {
+        struct UiPrimCfg
+        {
+            bool on = false;
+        };
+        static const UiPrimCfg s_uiPrims = []() {
+            UiPrimCfg c;
+            const char *e = std::getenv("SWORD_UI_CB_PRIMS");
+            c.on = (e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0);
+            return c;
+        }();
+        if (s_uiPrims.on && (g_swordUiCbTag != 0u || g_swordUiCurWidget != 0u))
+        {
+            static std::unordered_map<uint32_t, uint32_t> s_uiPrimN;
+            const uint32_t key = (g_swordUiCbTag != 0u) ? (0x80000000u | g_swordUiCbTag)
+                                                        : g_swordUiCurWidget;
+            uint32_t &n = s_uiPrimN[key];
+            ++n;
+            if (n <= 12u || (n % 1000u) == 0u)
+            {
+                std::cout << (g_swordUiCbTag != 0u ? "[ui-cb-prim]" : "[ui-widget-prim]")
+                          << " cb=0x" << std::hex << g_swordUiCbTag
+                          << " widget=0x" << g_swordUiCurWidget
+                          << std::dec << " n=" << n
+                          << " type=" << static_cast<uint32_t>(state.prim.type)
+                          << " tme=" << static_cast<uint32_t>(state.prim.tme)
+                          << " fst=" << static_cast<uint32_t>(state.prim.fst)
+                          << " fbp=" << ctx.frame.fbp
+                          << " tbp0=" << ctx.tex0.tbp0
+                          << " psm=" << static_cast<uint32_t>(ctx.tex0.psm)
+                          << " cbp=" << ctx.tex0.cbp
+                          << " cpsm=" << static_cast<uint32_t>(ctx.tex0.cpsm)
+                          << " uv0=(" << (batch.vertices[0].u >> 4) << ","
+                          << (batch.vertices[0].v >> 4) << ")"
+                          << " stq0=(" << batch.vertices[0].s << ","
+                          << batch.vertices[0].t << "," << batch.vertices[0].q << ")"
+                          << " rgba0=(" << static_cast<uint32_t>(batch.vertices[0].r) << ","
+                          << static_cast<uint32_t>(batch.vertices[0].g) << ","
+                          << static_cast<uint32_t>(batch.vertices[0].b) << ","
+                          << static_cast<uint32_t>(batch.vertices[0].a) << ")"
+                          << std::endl;
+            }
+        }
+    }
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -872,9 +974,51 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
     const u32 zpsm = ctx.zbuf.psm;
 
-    const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
+    PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
+    // 2026-10-20 (hito 1.6): ¿el sprite de clear full-screen (RGBA 0, tme=0, abe=0) se descarta?
+    const bool clearCandidate = state.prim.type == GS_PRIM_SPRITE && !state.prim.tme &&
+                                !state.prim.abe && r == 0u && g == 0u && b == 0u && a == 0u;
+    {
+        static const bool s_clearProbe = []() {
+            const char *e = std::getenv("SWORD_CLEAR_PROBE");
+            return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+        }();
+        static const bool s_clearForce = []() {
+            const char *e = std::getenv("SWORD_CLEAR_FORCE");
+            return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+        }();
+        if (clearCandidate && s_clearProbe)
+        {
+            static uint32_t s_n = 0u, s_discard = 0u;
+            if (s_n++ < 20u)
+                std::cout << "[clear-probe] xy=(" << x << "," << y << ")"
+                          << " test=0x" << std::hex << ctx.test << std::dec
+                          << " mask=" << writeMask.writeRgb << writeMask.writeAlpha << writeMask.writeDepth
+                          << " fbp=" << ctx.frame.fbp << " fbw=" << ctx.frame.fbw
+                          << " fbmsk=0x" << std::hex << ctx.frame.fbmsk << std::dec
+                          << " scissor=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
+                          << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")" << std::endl;
+            if (!writeMask.writesFramebuffer() && s_discard++ < 20u)
+                std::cout << "[clear-probe] DISCARD xy=(" << x << "," << y << ")"
+                          << " test=0x" << std::hex << ctx.test << std::dec << std::endl;
+        }
+        if (clearCandidate && s_clearForce && !writeMask.writesFramebuffer())
+        {
+            writeMask.writeRgb = true;
+            writeMask.writeAlpha = true;
+            writeMask.writeDepth = false;
+        }
+    }
     if (!writeMask.writesAnything())
     {
+        // DIAG 2026-10-18: ¿los sprites texturizados se DESCARTAN por alpha test (alpha=0)?
+        static uint32_t s_discLog = 0u;
+        if (state.prim.tme && s_discLog++ < 10u)
+            std::cout << "[raster-probe] DISCARD tme=1 dest fbp=" << ctx.frame.fbp << " fbw=" << ctx.frame.fbw
+                      << " psm=" << fpsm << " xy=(" << x << "," << y << ")"
+                      << " rgba=(" << static_cast<uint32_t>(r) << "," << static_cast<uint32_t>(g) << ","
+                      << static_cast<uint32_t>(b) << "," << static_cast<uint32_t>(a) << ")"
+                      << " test=0x" << std::hex << ctx.test << " alpha=0x" << ctx.alpha << std::dec << std::endl;
         return;
     }
 
@@ -1038,6 +1182,17 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     {
     case GS_PSM_CT32:
     {
+        // DIAG 2026-10-18: ¿la entrada de CLUT es 0 (cache vacio) o el indice no la alcanza?
+        {
+            static uint32_t s_clN = 0u;
+            if (s_clN++ < 8u)
+                std::cout << "[clut-probe] idx=" << static_cast<uint32_t>(index)
+                          << " clutIndex=" << clutIndex
+                          << " c0=" << m_clut[clutIndex] << " c256=" << m_clut[clutIndex + 256u]
+                          << " csm=" << static_cast<uint32_t>(csm)
+                          << " csa=" << static_cast<uint32_t>(csa)
+                          << " cbp0=" << m_clutCbp[0] << " cbp1=" << m_clutCbp[1] << std::endl;
+        }
         const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw);
     }
@@ -1091,6 +1246,31 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
         u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
+        // DIAG 2026-10-18: valor crudo del texel (indice en PSMT8) para ver si el 0 viene del indice
+        // o del lookup de la CLUT (que se sirve solo desde el cache m_clut).
+        {
+            static uint32_t s_txN = 0u;
+            if (s_txN++ < 8u)
+                std::cout << "[tex-probe] raw=0x" << std::hex << out << std::dec
+                          << " su=" << sampleU << " sv=" << sampleV
+                          << " psm=" << static_cast<uint32_t>(tex.psm) << " tbp0=" << tex.tbp0
+                          << " tbw=" << static_cast<uint32_t>(tex.tbw)
+                          << " texW=" << texW << " texH=" << texH
+                          << " cbp=" << tex.cbp << " cpsm=" << static_cast<uint32_t>(tex.cpsm) << std::endl;
+        }
+
+        // DIAG 2026-10-18 (Gemini v77): indice crudo + valor de CLUT para el atlas (tbp0=10272).
+        if (tex.tbp0 == 10272u)
+        {
+            static uint32_t s_sdN = 0u;
+            if (s_sdN++ < 12u)
+                std::cout << "[sample-diag] su=" << sampleU << " sv=" << sampleV
+                          << " rawIdx=" << static_cast<uint32_t>(static_cast<uint8_t>(out))
+                          << " clutVal=0x" << std::hex
+                          << LookupCLUT(state, static_cast<uint8_t>(out), tex.cpsm, tex.csm, tex.csa, tex.psm)
+                          << std::dec << std::endl;
+        }
+
         switch (tex.psm)
         {
         case GS_PSM_CT32:
@@ -1116,6 +1296,10 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     if (!state.linearFilter)
     {
+        // NEAREST: la spec del GS TRUNCA (no redondea). PCSX2 GSDrawScanline.cpp:835-844 aplica el
+        // sesgo de medio texel (-0x8000) SOLO bajo `if (sel.ltf)`, y deriva el texel con
+        // `uv0 = u.sra32<16>()` (shift aritmético = truncamiento hacia -inf).
+        // NO sumar 0.5 aquí: seria un desplazamiento de medio texel (dibujaria lo que el real descarta).
         return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
     }
 
@@ -1197,6 +1381,29 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
     const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
     const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+
+    // DIAG 2026-10-18: ¿donde dibujan los sprites texturizados y con que color/alpha de vertice?
+    {
+        static uint32_t s_dsN = 0u;
+        if (state.prim.tme && s_dsN++ < 10u)
+            std::cout << "[raster-probe] sprite tme=1 abe=" << static_cast<uint32_t>(state.prim.abe)
+                      << " fst=" << static_cast<uint32_t>(state.prim.fst)
+                      << " dest fbp=" << ctx.frame.fbp << " fbw=" << ctx.frame.fbw
+                      << " psm=" << static_cast<uint32_t>(ctx.frame.psm)
+                      << " rect=(" << unclippedX0 << "," << unclippedY0 << ")-(" << unclippedX1 << "," << unclippedY1 << ")"
+                      << " ctr=" << (drawX1 - drawX0 + 1) << "x" << (drawY1 - drawY0 + 1)
+                      << " scissor=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-(" << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
+                      << " rgba0=(" << static_cast<uint32_t>(v0.r) << "," << static_cast<uint32_t>(v0.g) << ","
+                      << static_cast<uint32_t>(v0.b) << "," << static_cast<uint32_t>(v0.a) << ")"
+                      << " rgba1=(" << static_cast<uint32_t>(v1.r) << "," << static_cast<uint32_t>(v1.g) << ","
+                      << static_cast<uint32_t>(v1.b) << "," << static_cast<uint32_t>(v1.a) << ")"
+                      << " texW=" << state.textureWidth << " texH=" << state.textureHeight
+                      << " test=0x" << std::hex << ctx.test << " alpha=0x" << ctx.alpha << std::dec
+                      << " texa=(aem=" << static_cast<uint32_t>(state.texa.aem)
+                      << " ta0=0x" << std::hex << static_cast<uint32_t>(state.texa.ta0) << std::dec << ")"
+                      << " tcc=" << static_cast<uint32_t>(ctx.tex0.tcc)
+                      << " tfx=" << static_cast<uint32_t>(ctx.tex0.tfx) << std::endl;
+    }
 
     const uint64_t alphaReg = ctx.alpha;
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
@@ -1284,6 +1491,27 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
 
+    // DIAG 2026-10-18: la UV/ST del vertice que entra al draw texturizado (el texel sale (0,0) =>
+    // su=0 sv=0 en todos los pixeles). Buscamos donde se pierde: packed (m_cur U/V o S/T/Q) o registro.
+    {
+        static uint32_t s_uvN = 0u;
+        if (state.prim.tme && s_uvN++ < 6u)
+            std::cout << "[uv-probe] tme=1 fst=" << static_cast<uint32_t>(state.prim.fst)
+                      << " type=" << static_cast<uint32_t>(state.prim.type) << std::hex
+                      << " v0(u=0x" << static_cast<uint32_t>(v0.u) << " v=0x" << static_cast<uint32_t>(v0.v) << ")"
+                      << " v1(u=0x" << static_cast<uint32_t>(v1.u) << " v=0x" << static_cast<uint32_t>(v1.v) << ")"
+                      << " v2(u=0x" << static_cast<uint32_t>(v2.u) << " v=0x" << static_cast<uint32_t>(v2.v) << ")"
+                      << std::dec
+                      << " s0=" << v0.s << " t0=" << v0.t << " q0=" << v0.q
+                      << " s1=" << v1.s << " t1=" << v1.t << " q1=" << v1.q
+                      << " s2=" << v2.s << " t2=" << v2.t << " q2=" << v2.q
+                      << " xyz0=(" << v0.x << "," << v0.y << ")"
+                      << " xyz1=(" << v1.x << "," << v1.y << ")"
+                      << " xyz2=(" << v2.x << "," << v2.y << ")"
+                      << " texW=" << state.textureWidth << " texH=" << state.textureHeight
+                      << " tbp0=" << ctx.tex0.tbp0 << std::endl;
+    }
+
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;
 
@@ -1311,6 +1539,11 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
+    // DIAG 2026-10-18 (Gemini v71 paso 1): loguear el PRIM QUE RAIZASTERIZA (una vez por prim, dentro del
+    // lazo de pixeles), no los 6 primeros (que son padding degenerado con S=T=0).
+    bool diagLoggedThisPrim = false;
+    static uint32_t s_diagPrimLog = 0u;
+    uint32_t diagTexelTotal = 0u, diagTexelNonZero = 0u;
 
     for (int y = minY; y <= maxY; ++y)
     {
@@ -1375,6 +1608,63 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
                 uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
 
+                // DIAG 2026-10-18: histograma de texeles por prim (¿alguna muestra un glifo real?).
+                ++diagTexelTotal;
+                if (texel != 0u)
+                    ++diagTexelNonZero;
+
+                // DIAG 2026-10-18 (Gemini v76): estado de la CLUT en los draws del atlas (tbp0=10272).
+                if (ctx.tex0.tbp0 == 10272u)
+                {
+                    static uint32_t s_glyphLog = 0u;
+                    if (s_glyphLog++ < 8u)
+                        std::cout << "[glyph-draw] cbp=" << ctx.tex0.cbp
+                                  << " cld=" << static_cast<uint32_t>(ctx.tex0.cld)
+                                  << " csm=" << static_cast<uint32_t>(ctx.tex0.csm)
+                                  << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
+                                  << " texel=0x" << std::hex << texel
+                                  << " m_clut[1]=0x" << static_cast<uint32_t>(m_clut[1])
+                                  << " m_clut[257]=0x" << static_cast<uint32_t>(m_clut[257])
+                                  << " m_clut[15]=0x" << static_cast<uint32_t>(m_clut[15])
+                                  << " m_clut[271]=0x" << static_cast<uint32_t>(m_clut[271])
+                                  << std::dec << std::endl;
+                }
+
+                if (!diagLoggedThisPrim && s_diagPrimLog < 12u)
+                {
+                    ++s_diagPrimLog;
+                    diagLoggedThisPrim = true;
+                    std::cout << "[real-tri-probe] #" << s_diagPrimLog
+                              << " fst=" << static_cast<uint32_t>(state.prim.fst)
+                              << " type=" << static_cast<uint32_t>(state.prim.type)
+                              << " fbp=" << ctx.frame.fbp << " fbw=" << ctx.frame.fbw
+                              << " tbp0=" << ctx.tex0.tbp0 << " texW=" << state.textureWidth
+                              << " texH=" << state.textureHeight
+                              << " cbp=" << ctx.tex0.cbp << " cpsm=" << static_cast<uint32_t>(ctx.tex0.cpsm)
+                              << " cld=" << static_cast<uint32_t>(ctx.tex0.cld)
+                              << " csm=" << static_cast<uint32_t>(ctx.tex0.csm)
+                              << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
+                              << "\n  v0 xyz=(" << v0.x << "," << v0.y << ") st=(" << v0.s << "," << v0.t
+                              << ") q=" << v0.q << " uv=(" << static_cast<uint32_t>(v0.u) << ","
+                              << static_cast<uint32_t>(v0.v) << ") rgba=(" << static_cast<uint32_t>(v0.r)
+                              << "," << static_cast<uint32_t>(v0.g) << "," << static_cast<uint32_t>(v0.b)
+                              << "," << static_cast<uint32_t>(v0.a) << ")"
+                              << "\n  v1 xyz=(" << v1.x << "," << v1.y << ") st=(" << v1.s << "," << v1.t
+                              << ") q=" << v1.q
+                              << "\n  v2 xyz=(" << v2.x << "," << v2.y << ") st=(" << v2.s << "," << v2.t
+                              << ") q=" << v2.q
+                              << "\n  px=(" << x << "," << y << ") is=" << is << " it=" << it
+                              << " iq=" << iq << " iu=" << iu << " iv=" << iv
+                              << " texUf=" << (state.prim.fst ? static_cast<float>(iu) / 16.0f
+                                                              : is / fabsQ(iq) * static_cast<float>(state.textureWidth))
+                              << " texVf=" << (state.prim.fst ? static_cast<float>(iv) / 16.0f
+                                                              : it / fabsQ(iq) * static_cast<float>(state.textureHeight))
+                              << " texel=0x" << std::hex << texel << std::dec
+                              << " texrgba=(" << static_cast<uint32_t>(tr) << "," << static_cast<uint32_t>(tg)
+                              << "," << static_cast<uint32_t>(tb) << "," << static_cast<uint32_t>(ta) << ")"
+                              << std::endl;
+                }
+
                 const auto &tex = ctx.tex0;
                 const uint8_t shadeR = r;
                 const uint8_t shadeG = g;
@@ -1386,11 +1676,68 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 g = color.g;
                 b = color.b;
                 a = color.a;
+                // DIAG 2026-10-18: separar vertice vs texel como fuente del alpha=0 (que hace que el
+                // alpha test, ATST=5 AREF=2 AFAIL=KEEP, descarte TODO y la VRAM quede vacia).
+                {
+                    static uint32_t s_tpN = 0u;
+                    if (s_tpN++ < 8u)
+                        std::cout << "[tri-probe] v0=(" << static_cast<uint32_t>(v0.r) << "," << static_cast<uint32_t>(v0.g)
+                                  << "," << static_cast<uint32_t>(v0.b) << "," << static_cast<uint32_t>(v0.a) << ")"
+                                  << " shade=(" << static_cast<uint32_t>(shadeR) << "," << static_cast<uint32_t>(shadeG)
+                                  << "," << static_cast<uint32_t>(shadeB) << "," << static_cast<uint32_t>(shadeA) << ")"
+                                  << " texel=(" << static_cast<uint32_t>(tr) << "," << static_cast<uint32_t>(tg)
+                                  << "," << static_cast<uint32_t>(tb) << "," << static_cast<uint32_t>(ta) << ")"
+                                  << " out=(" << static_cast<uint32_t>(color.r) << "," << static_cast<uint32_t>(color.g)
+                                  << "," << static_cast<uint32_t>(color.b) << "," << static_cast<uint32_t>(color.a) << ")"
+                                  << " tcc=" << static_cast<uint32_t>(tex.tcc) << " tfx=" << static_cast<uint32_t>(tex.tfx)
+                                  << " psm=" << static_cast<uint32_t>(tex.psm) << " cpsm=" << static_cast<uint32_t>(tex.cpsm)
+                                  << " tbp0=" << tex.tbp0 << " cbp=" << tex.cbp
+                                  << " cld=" << static_cast<uint32_t>(tex.cld)
+                                  << " csm=" << static_cast<uint32_t>(tex.csm)
+                                  << " csa=" << static_cast<uint32_t>(tex.csa)
+                                  << " iip=" << static_cast<uint32_t>(state.prim.iip)
+                                  << " xy=(" << x << "," << y << ")" << std::endl;
+                }
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
+    }
+
+    // DIAG 2026-10-18: resumen por prim (¿los prims texturizados muestrean glifos reales alguna vez?).
+    if (state.prim.tme)
+    {
+        static uint32_t s_histN = 0u, s_primTotal = 0u, s_primWithNonZero = 0u;
+        static uint32_t s_stVaryPrims = 0u, s_stVaryTexelNZ = 0u;
+        ++s_primTotal;
+        if (diagTexelNonZero != 0u)
+            ++s_primWithNonZero;
+        const bool stVary = (v0.s != v1.s) || (v1.s != v2.s) || (v0.t != v1.t) || (v1.t != v2.t);
+        if (stVary)
+        {
+            ++s_stVaryPrims;
+            if (diagTexelNonZero != 0u)
+                ++s_stVaryTexelNZ;
+        }
+        if (s_histN < 20u)
+        {
+            ++s_histN;
+            std::cout << "[tex-hist] #" << s_histN
+                      << " fbp=" << ctx.frame.fbp
+                      << " tbp0=" << ctx.tex0.tbp0
+                      << " psm=" << static_cast<uint32_t>(ctx.tex0.psm)
+                      << " rgba0=(" << static_cast<uint32_t>(v0.r) << "," << static_cast<uint32_t>(v0.g)
+                      << "," << static_cast<uint32_t>(v0.b) << "," << static_cast<uint32_t>(v0.a) << ")"
+                      << " stvary=" << (stVary ? 1 : 0)
+                      << " px=" << diagTexelTotal << " texelNZ=" << diagTexelNonZero
+                      << std::endl;
+        }
+        if ((s_primTotal % 200u) == 0u)
+            std::cout << "[tex-hist] TOTAL texturedPrims=" << s_primTotal
+                      << " withNonZeroTexel=" << s_primWithNonZero
+                      << " stVaryPrims=" << s_stVaryPrims
+                      << " stVaryWithNonZeroTexel=" << s_stVaryTexelNZ << std::endl;
     }
 }
 
@@ -1852,7 +2199,11 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
     {
         static uint32_t s_presentN = 0u;
         const uint32_t n = ++s_presentN;
-        if (n == 300u || n == 900u || n == 1500u)
+        static const uint32_t s_dumpAt = []() {
+            const char *a = std::getenv("SWORD_DUMP_VRAM_AT");
+            return (a != nullptr && *a != '\0') ? static_cast<uint32_t>(std::strtoul(a, nullptr, 10)) : 0u;
+        }();
+        if (n == 300u || n == 900u || n == 1500u || (s_dumpAt != 0u && n == s_dumpAt))
         {
             const std::string path = std::strcmp(vp, "1") == 0 ? std::string("/tmp/recomp_vram.bin") : std::string(vp);
             std::ofstream out(path, std::ios::binary);
@@ -1929,6 +2280,63 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 
     // Snapshot local memory under the backend lock, then perform the expensive
     // display conversion without holding the producer-side raster lock.
+    // DIAG 2026-10-18 (Gemini v78): inyectar la page 321 REAL (atlas de glifos + su paleta) en cada
+    // present. Necesario porque el juego re-sube la page 320 en dbp=10272 (page 321 queda como copia).
+    // Env-gated: SWORD_INJECT_PAGE321=<GS sin header>. NO es fix real.
+    if (const char *pagePath = std::getenv("SWORD_INJECT_PAGE321"); pagePath != nullptr && m_vram != nullptr)
+    {
+        static std::vector<uint8_t> s_page321;
+        static bool s_page321Loaded = false;
+        if (!s_page321Loaded)
+        {
+            s_page321Loaded = true;
+            if (std::FILE *pf = std::fopen(pagePath, "rb"))
+            {
+                s_page321.resize(0x2000u);
+                std::fseek(pf, 0x282000L, SEEK_SET);
+                if (std::fread(s_page321.data(), 1u, 0x2000u, pf) != 0x2000u)
+                    s_page321.clear();
+                std::fclose(pf);
+                std::cout << "[inject-page321] loaded=" << s_page321.size() << " from " << pagePath << std::endl;
+            }
+        }
+        if (s_page321.size() == 0x2000u && m_vramSize >= 0x284000u)
+            std::memcpy(m_vram + 0x282000u, s_page321.data(), 0x2000u);
+    }
+
+    // DIAG 2026-10-18 (Gemini v80): inyectar las 11 paginas de UI (0x280000..0x296000, 88 KB) e
+    // invalidar caches. Env-gated: SWORD_INJECT_UI_VRAM=<GS sin header>. NO es fix real.
+    if (const char *uiPath = std::getenv("SWORD_INJECT_UI_VRAM"); uiPath != nullptr && m_vram != nullptr)
+    {
+        static std::vector<uint8_t> s_uiVram;
+        static bool s_uiVramLoaded = false;
+        static uint32_t s_uiVramPresent = 0u;
+        if (!s_uiVramLoaded)
+        {
+            s_uiVramLoaded = true;
+            if (std::FILE *pf = std::fopen(uiPath, "rb"))
+            {
+                s_uiVram.resize(0x16000u);
+                std::fseek(pf, 0x280000L, SEEK_SET);
+                if (std::fread(s_uiVram.data(), 1u, 0x16000u, pf) != 0x16000u)
+                    s_uiVram.clear();
+                std::fclose(pf);
+                std::cout << "[inject-ui-vram] loaded=" << s_uiVram.size() << " from " << uiPath << std::endl;
+            }
+        }
+        if (s_uiVram.size() == 0x16000u && m_vramSize >= 0x296000u)
+        {
+            std::memcpy(m_vram + 0x280000u, s_uiVram.data(), 0x16000u);
+            m_texturePageCache.Invalidate();
+            m_clutCbp.fill(0xFFFFFFFFu);
+            if (++s_uiVramPresent <= 3u)
+            {
+                std::cout << "[inject-ui-vram] copiadas 11 paginas + caches invalidados (present #"
+                          << s_uiVramPresent << ")" << std::endl;
+            }
+        }
+    }
+
     thread_local std::vector<uint8_t> snapshot;
     SnapshotVram(snapshot);
     if (snapshot.empty())
@@ -1946,8 +2354,24 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
-    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+    GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+    // DIAG 2026-10-18 (Gemini v71 paso 3): el juego NUNCA escribe DISPFB1 (queda en el default del
+    // runtime 0x1400 = fbp 0) pero dibuja en el frame del contexto activo (page 128, que es el DISPFB1
+    // del real). Env-gated: si dispfb1 es el default, presentar el frame del contexto 0.
+    if (std::getenv("SWORD_PRESENT_CTX") != nullptr && request.dispfb1 == 0x1400ull &&
+        request.contextFrames[0].fbw != 0u)
+    {
+        static bool s_ctxLog = false;
+        if (!s_ctxLog)
+        {
+            s_ctxLog = true;
+            std::cout << "[present-ctx] dispfb1 default -> presentando ctx frame fbp="
+                      << request.contextFrames[0].fbp << " fbw=" << request.contextFrames[0].fbw
+                      << " psm=" << static_cast<uint32_t>(request.contextFrames[0].psm) << std::endl;
+        }
+        displayFrame1 = request.contextFrames[0];
+    }
     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
@@ -2023,19 +2447,36 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
 
         if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
         {
+            static uint32_t s_fbLog = 0u;
+            const bool logFb = (s_fbLog++ < 8u);
             for (const GSFrameReg &candidate : request.contextFrames)
             {
                 if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
+                {
+                    if (logFb)
+                        std::cout << "[present-fb] skip cand fbp=" << candidate.fbp << " (== selected)" << std::endl;
                     continue;
+                }
                 std::vector<uint8_t> candidatePixels;
-                if (!CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u))
+                const bool ok = CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u);
+                const uint32_t cnz = ok ? countNonBlackPixels(candidatePixels, width, height) : 0u;
+                if (logFb)
+                    std::cout << "[present-fb] cand fbp=" << candidate.fbp << " fbw=" << candidate.fbw
+                              << " psm=" << static_cast<uint32_t>(candidate.psm) << " copy=" << ok
+                              << " nz=" << cnz << " (w=" << width << " h=" << height << ")" << std::endl;
+                if (!ok)
                     continue;
-                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
+                if (cnz == 0u)
                     continue;
                 selected = candidate;
                 pixels.swap(candidatePixels);
                 break;
             }
+            if (logFb)
+                std::cout << "[present-fb] -> selected.fbp=" << selected.fbp
+                          << " hasPreferred=" << request.hasPreferredSource
+                          << " prefSrc.fbp=" << request.preferredSource.fbp
+                          << " prefDestFbp=" << request.preferredDestFbp << std::endl;
         }
         return true;
     };

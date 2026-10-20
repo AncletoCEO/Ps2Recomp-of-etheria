@@ -899,6 +899,21 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         m_curG = static_cast<uint8_t>((lo >> 32) & 0xFF);
         m_curB = static_cast<uint8_t>(hi & 0xFF);
         m_curA = static_cast<uint8_t>((hi >> 32) & 0xFF);
+        // 2026-10-20 (hito 1.6): el path VU1/GIF packed no pasa por GS_REG_RGBAQ.
+        if (std::getenv("SWORD_VTX_PROBE") != nullptr &&
+            m_curR == m_curB && m_curG == 0u && (m_curR != 0u || m_curB != 0u))
+        {
+            static uint32_t s_packedMagenta = 0u;
+            if (s_packedMagenta < 40u)
+            {
+                RUNTIME_LOG("[vtx-probe] lo=0x" << std::hex << lo << " hi=0x" << hi
+                            << std::dec << " rgba=(" << static_cast<uint32_t>(m_curR) << ","
+                            << static_cast<uint32_t>(m_curG) << ","
+                            << static_cast<uint32_t>(m_curB) << ","
+                            << static_cast<uint32_t>(m_curA) << ")");
+            }
+            ++s_packedMagenta;
+        }
         break;
     case 0x02:
     {
@@ -1199,6 +1214,21 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         std::memcpy(&m_curQ, &qBits, 4);
         if (m_curQ == 0.0f)
             m_curQ = 1.0f;
+        // 2026-10-20 (hito 1.6): ¿el juego envía el vértice magenta (R=B, G=0)?
+        if (std::getenv("SWORD_RGBAQ_PROBE") != nullptr &&
+            m_curR == m_curB && m_curG == 0u && (m_curR != 0u || m_curB != 0u))
+        {
+            static uint32_t s_magentaWrites = 0u;
+            if (s_magentaWrites < 50u)
+            {
+                RUNTIME_LOG("[rgbaq-probe] raw=0x" << std::hex << value << std::dec
+                            << " rgba=(" << static_cast<uint32_t>(m_curR) << ","
+                            << static_cast<uint32_t>(m_curG) << ","
+                            << static_cast<uint32_t>(m_curB) << ","
+                            << static_cast<uint32_t>(m_curA) << ")");
+            }
+            ++s_magentaWrites;
+        }
         // TRIAGE 2026-10-08: ¿el juego escribe RGBAQ en algún momento?
         {
             static uint32_t s_rgbaqWrites = 0;
@@ -1273,6 +1303,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TEX0_2:
     {
         int ci = (regAddr == GS_REG_TEX0_2) ? 1 : 0;
+        // DIAG 2026-10-19 (Gemini v81): nuestro motor emite el TEX0 del fallback 64x64 (tw=6/th=6,
+        // cbp=10300) para tbp0=10272; el descriptor real de la fuente es 128x128
+        // (0x20050C05DD30A820: tw=7/th=7, cbp=10336). Env-gated: forzar el TEX0 completo.
+        if (std::getenv("SWORD_FORCE_FONT_CBP") != nullptr && (value & 0x3FFFull) == 10272ull)
+        {
+            static uint32_t s_forceTex0Log = 0u;
+            if (s_forceTex0Log++ < 8u)
+                std::cout << "[force-tex0] tbp0=10272 raw 0x" << std::hex << value
+                          << " -> 0x20050C05DD30A820" << std::dec << std::endl;
+            value = 0x20050C05DD30A820ull;
+        }
         auto &t = m_ctx[ci].tex0;
         t.tbp0 = static_cast<uint32_t>(value & 0x3FFF);
         t.tbw = static_cast<uint8_t>((value >> 14) & 0x3F);
@@ -1286,6 +1327,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        // DIAG 2026-10-19 (Gemini v81): el descriptor real de la fuente (0xE702E0, 128x128) tiene
+        // TEX0 = 0x20050C05DD30A820 (cbp=10336, page 323); nuestro gestor usa el fallback 64x64
+        // (cbp=+28 -> 10300). Env-gated: forzar el CBP del atlas para validar el pipeline.
+        if (std::getenv("SWORD_FORCE_FONT_CBP") != nullptr && t.tbp0 == 10272u && t.cbp == 10300u)
+        {
+            static uint32_t s_forceCbpLog = 0u;
+            if (s_forceCbpLog++ < 8u)
+                std::cout << "[force-cbp] tbp0=10272 cbp 10300 -> 10336 (page 323)" << std::endl;
+            t.cbp = 10336u;
+        }
         m_backend->LoadClut(t, m_texclut);
         break;
     }
@@ -1317,6 +1368,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        // DIAG 2026-10-19 (Gemini v81): el descriptor real de la fuente (0xE702E0, 128x128) tiene
+        // TEX0 = 0x20050C05DD30A820 (cbp=10336, page 323); nuestro gestor usa el fallback 64x64
+        // (cbp=+28 -> 10300). Env-gated: forzar el CBP del atlas para validar el pipeline.
+        if (std::getenv("SWORD_FORCE_FONT_CBP") != nullptr && t.tbp0 == 10272u && t.cbp == 10300u)
+        {
+            static uint32_t s_forceCbpLog = 0u;
+            if (s_forceCbpLog++ < 8u)
+                std::cout << "[force-cbp] tbp0=10272 cbp 10300 -> 10336 (page 323)" << std::endl;
+            t.cbp = 10336u;
+        }
         m_backend->LoadClut(t, m_texclut);
         break;
     }
@@ -1662,7 +1723,8 @@ void GS::vertexKick(bool drawing)
                          << " rgba=(" << static_cast<uint32_t>(v.r) << ","
                          << static_cast<uint32_t>(v.g) << ","
                          << static_cast<uint32_t>(v.b) << ","
-                         << static_cast<uint32_t>(v.a) << ")" << std::endl);
+                         << static_cast<uint32_t>(v.a) << ")"
+                         << " pc=0x" << std::hex << g_lastStorePc << std::dec << std::endl);
         }
         if ((s_total % 20000u) == 0u) {
             RUNTIME_LOG("[gs:content] TOTAL kicks=" << s_total
@@ -1675,6 +1737,41 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        // DIAG 2026-10-18 (Gemini v72 paso 1): telemetria GLOBAL de draws, independiente del tipo:
+        // cuenta prims por tipo y draws texturizados por TBP0. Responde "¿alguna draw usa el atlas
+        // (tbp0 >= 10272) o todas caen en la page 320?".
+        {
+            static uint64_t s_typeCount[8] = {0};
+            static uint64_t s_draws = 0;
+            static uint32_t s_tbpVal[8] = {0};
+            static uint64_t s_tbpCount[8] = {0};
+            static uint32_t s_tbpSlots = 0;
+            ++s_draws;
+            s_typeCount[static_cast<uint32_t>(m_prim.type) & 7u]++;
+            if (m_prim.tme)
+            {
+                const uint32_t tbp = m_ctx[m_prim.ctxt ? 1 : 0].tex0.tbp0;
+                uint32_t slot = 8u;
+                for (uint32_t i = 0; i < s_tbpSlots; ++i)
+                    if (s_tbpVal[i] == tbp) { slot = i; break; }
+                if (slot == 8u && s_tbpSlots < 8u) { slot = s_tbpSlots++; s_tbpVal[slot] = tbp; }
+                if (slot < 8u) s_tbpCount[slot]++;
+            }
+            if ((s_draws % 120u) == 0u)
+            {
+                RUNTIME_LOG("[gs:prims] draws=" << s_draws
+                             << " POINT=" << s_typeCount[0]
+                             << " LINE=" << (s_typeCount[1] + s_typeCount[2])
+                             << " TRI=" << s_typeCount[3]
+                             << " TRISTRIP=" << s_typeCount[4]
+                             << " TRIFAN=" << s_typeCount[5]
+                             << " SPRITE=" << s_typeCount[6]);
+                for (uint32_t i = 0; i < s_tbpSlots; ++i)
+                    RUNTIME_LOG("[gs:prims]   tbp0=" << s_tbpVal[i]
+                                 << " (page " << (s_tbpVal[i] / 32u) << ")"
+                                 << " texturedDraws=" << s_tbpCount[i]);
+            }
+        }
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
@@ -1825,6 +1922,35 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
                              ctx.frame.fbp != ctx.tex0.tbp0 && alphaMode == 0x64u &&
                              (alphaFix == 0x60u || alphaFix == 0x80u) &&
                              x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447;
+    // DIAG 2026-10-18: ¿el juego hace el "display copy" (blit del framebuffer a la pagina de display)?
+    // Es el patron que el present usa para saber QUE pagina presentar. Sin esto, se presenta la
+    // DISPFB (que el juego nunca escribe) y queda negro.
+    {
+        static uint32_t s_fullN = 0, s_dcHit = 0;
+        const bool fullScreen = (x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447);
+        if (state.prim.type == GS_PRIM_SPRITE && fullScreen)
+        {
+            ++s_fullN;
+            if (s_fullN <= 10u)
+                RUNTIME_LOG("[dc-probe] full-screen sprite tme=" << (int)state.prim.tme
+                             << " abe=" << (int)state.prim.abe << " fst=" << (int)state.prim.fst
+                             << " ctxt=" << (int)state.prim.ctxt
+                             << " frame.fbp=" << ctx.frame.fbp << " frame.psm=" << (int)ctx.frame.psm
+                             << " tex0.tbp0=" << ctx.tex0.tbp0 << " psm=" << (int)ctx.tex0.psm
+                             << " tbw=" << (int)ctx.tex0.tbw << " tw=" << (int)ctx.tex0.tw << " th=" << (int)ctx.tex0.th
+                             << " alphaMode=0x" << std::hex << (int)alphaMode
+                             << " alphaFix=0x" << (int)alphaFix << std::dec
+                             << " x=[" << x0 << "," << xEnd << "] y=[" << y0 << "," << yEnd << "] dc=" << displayCopy);
+        }
+        if (displayCopy)
+        {
+            ++s_dcHit;
+            if (s_dcHit <= 10u)
+                RUNTIME_LOG("[dc-probe] displayCopy DETECTADO src tbp0=" << ctx.tex0.tbp0
+                             << " fbw=" << (int)ctx.tex0.tbw << " psm=" << (int)ctx.tex0.psm
+                             << " -> destFbp=" << ctx.frame.fbp);
+        }
+    }
     if (displayCopy)
     {
         m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};

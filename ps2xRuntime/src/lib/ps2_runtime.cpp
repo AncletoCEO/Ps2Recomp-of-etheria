@@ -29,6 +29,10 @@
 #include <unordered_map>
 #include <sstream>
 
+// 2026-10-19 (hito 1.1): definidos en game_overrides.cpp; widget y callback en render.
+extern uint32_t g_swordUiCurWidget;
+extern uint32_t g_swordUiCbTag;
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -1437,6 +1441,68 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    // 2026-10-19 (hito 1.1): enumera los callbacks de render que FUN_006daef0 invoca por jalr en
+    // 0x6daf6c / 0x6dafcc / 0x6db02c / 0x6db06c. Env: SWORD_UI_CB_LOG=1 (OFF por defecto).
+    // Loguea una vez por destino distinto y un conteo cada 1000; correlaciona con el widget actual.
+    {
+        struct UiCbCfg
+        {
+            bool on = false;
+        };
+        static const UiCbCfg s_uiCb = []() {
+            UiCbCfg c;
+            const char *e = std::getenv("SWORD_UI_CB_LOG");
+            c.on = (e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0);
+            return c;
+        }();
+        const bool isUiSite = (sourcePc == 0x6DAF6Cu || sourcePc == 0x6DAFCCu ||
+                               sourcePc == 0x6DB02Cu || sourcePc == 0x6DB06Cu);
+        if (s_uiCb.on && kind == GuestBranchKind::IndirectCall && isUiSite)
+        {
+            static std::unordered_map<uint32_t, uint32_t> s_seen;
+            static uint32_t s_total = 0u;
+            ++s_total;
+            const uint32_t cmd = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            auto it = s_seen.find(targetPc);
+            if (it == s_seen.end())
+            {
+                s_seen.emplace(targetPc, 1u);
+                RUNTIME_LOG("[ui-cb] NEW target=0x" << std::hex << targetPc
+                            << " src=0x" << sourcePc
+                            << " widget=0x" << g_swordUiCurWidget
+                            << " cmd=0x" << cmd
+                            << std::dec << " total=" << s_total << "\n");
+            }
+            else
+            {
+                ++it->second;
+                if ((it->second % 1000u) == 0u)
+                {
+                    RUNTIME_LOG("[ui-cb] cnt target=0x" << std::hex << targetPc
+                                << " n=" << std::dec << it->second
+                                << " total=" << s_total << "\n");
+                }
+            }
+        }
+        // 2026-10-19 (hito 1.2): dentro de un callback de UI, enumerar a que llama (directo o
+        // indirecto) para ubicar el emisor real de geometria. Dedupe por destino, max 3 c/u.
+        const bool isCallKind = (kind == GuestBranchKind::DirectCall ||
+                                 kind == GuestBranchKind::IndirectCall);
+        if (s_uiCb.on && g_swordUiCbTag != 0u && isCallKind &&
+            sourcePc >= 0x754590u && sourcePc < 0x756C00u)
+        {
+            static std::unordered_map<uint32_t, uint32_t> s_inner;
+            uint32_t &c = s_inner[targetPc];
+            if (c++ < 3u)
+            {
+                RUNTIME_LOG("[ui-cb-call] cb=0x" << std::hex << g_swordUiCbTag
+                            << " src=0x" << sourcePc << " target=0x" << targetPc
+                            << std::dec << " kind=" << static_cast<int>(kind)
+                            << " n=" << c << "\n");
+            }
+        }
+    }
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
@@ -2531,6 +2597,45 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
                         << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
                         << std::dec << " n=" << s_vif1Kick
                         << " withData=" << s_vif1KickWithData);
+        }
+    }
+    // 2026-10-19 (hito 1.4 / v89): puntero a la camara activa *(0xA887B8). SWORD_FONT_ASSET=1.
+    if (vaddr == 0x00A887B8u)
+    {
+        static const bool s_camCtx = []() {
+            const char *e = std::getenv("SWORD_FONT_ASSET");
+            return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+        }();
+        if (s_camCtx)
+        {
+            static uint64_t s_camCtxN = 0ull;
+            if (s_camCtxN++ < 64ull)
+                RUNTIME_LOG("[cam:ctx] val=0x" << std::hex << value
+                            << " pc=0x" << (ctx ? ctx->pc : 0u)
+                            << " ra=0x" << (ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) : 0u)
+                            << std::dec << " n=" << s_camCtxN);
+        }
+    }
+    // 2026-10-19 (hito 1.3): la tabla del gestor de texturas en 0xA95650 esta TODA en cero en nuestro
+    // run (el real tiene 5 entradas: chrome, font, ...). Env SWORD_TEXREG_WATCH=1: quien la escribe.
+    if ((vaddr >= 0x00A95500u && vaddr < 0x00A95560u) ||
+        (vaddr >= 0x00A95650u && vaddr < 0x00A956B0u))
+    {
+        static const bool s_texregWatch = []() {
+            const char *e = std::getenv("SWORD_TEXREG_WATCH");
+            return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+        }();
+        if (s_texregWatch)
+        {
+            static uint64_t s_texregN = 0;
+            if (s_texregN++ < 96ull)
+            {
+                RUNTIME_LOG("[texreg-w] addr=0x" << std::hex << vaddr
+                            << " val=0x" << value
+                            << " pc=0x" << (ctx ? ctx->pc : 0u)
+                            << " ra=0x" << (ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) : 0u)
+                            << std::dec << " n=" << s_texregN);
+            }
         }
     }
     // 2026-10-17: vigila el flag +8 del objeto de fase (ver g_phaseObjectAddr). Quien lo ponga en 0

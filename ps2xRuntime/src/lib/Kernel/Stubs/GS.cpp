@@ -4,6 +4,8 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
+#include <cstdlib>
+#include <cstring>
 
 namespace ps2_stubs
 {
@@ -789,6 +791,18 @@ namespace ps2_stubs
         uint32_t interlace = getRegU32(ctx, 5);
         uint32_t omode = getRegU32(ctx, 6);
         uint32_t ffmode = getRegU32(ctx, 7);
+
+        // 2026-10-19 (hito 1.4): A/B de modo de video. En el savestate real (PAL) el env tiene
+        // smode=1 (interlace=1, ffmode=0); nuestro run arranca con smode=2 (interlace=0, ffmode=1).
+        // Env SWORD_FORCE_PAL=1 fuerza los args PAL para ver si el gate de culling pasa natural.
+        if (const char *pal = std::getenv("SWORD_FORCE_PAL"); pal != nullptr && *pal != '\0' &&
+            std::strcmp(pal, "0") != 0)
+        {
+            interlace = 1u;
+            ffmode = 0u;
+        }
+        RUNTIME_LOG("[gs-reset] mode=" << mode << " interlace=" << interlace
+                    << " omode=" << omode << " ffmode=" << ffmode << "\n");
 
         if (mode == 0)
         {

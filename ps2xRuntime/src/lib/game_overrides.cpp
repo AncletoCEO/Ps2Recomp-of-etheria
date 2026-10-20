@@ -23,6 +23,16 @@
 // wrapper del bucle de frame pueda publicar ahi el objeto de fase y Store32 vigilar su flag +8).
 extern uint32_t g_phaseObjectAddr;
 
+// 2026-10-19 (hito 1.1): widget que se esta renderizando en 0x6daef0. Lo lee la sonda de
+// dispatchGuestBranch para correlacionar el callback (jalr en 0x6daf6c/0x6dafcc/0x6db02c/0x6db06c)
+// con el widget cuya lista de comandos lo encolo. Solo se toca con SWORD_UI_CB_LOG=1.
+uint32_t g_swordUiCurWidget = 0u;
+
+// 2026-10-19 (hito 1.2): callback de render en ejecucion (0x7547a0 / 0x756a28 / 0x756ab0).
+// Lo lee GSCpuBackend::DrawPrimitive para atribuir cada prim al callback que lo emitio.
+// Solo se toca con SWORD_UI_CB_LOG=1 y solo se loguea con SWORD_UI_CB_PRIMS=1.
+uint32_t g_swordUiCbTag = 0u;
+
 namespace
 {
     // 2026-10-07g: wrap del original de 6e4848 (file-scope: las lambdas de
@@ -80,6 +90,46 @@ namespace
     PS2Runtime::RecompiledFunction g_orig6d6a80 = nullptr;
     PS2Runtime::RecompiledFunction g_orig6d6290 = nullptr;
     PS2Runtime::RecompiledFunction g_orig6d51b0 = nullptr;
+    // 2026-10-19 (hito): constructor de widgets del selector (via vtable+0x2DC) y su iterador interno.
+    PS2Runtime::RecompiledFunction g_orig805550 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig804c50 = nullptr;
+    // 2026-10-19 (hito): renderizador por-widget de la UI (0x6db0d0 lo llama una vez por widget/frame).
+    PS2Runtime::RecompiledFunction g_orig6daef0 = nullptr;
+    // 2026-10-19 (hito 1.1/1.2): callbacks de render que invoca 0x6daef0 (jalr de 0x6daf6c).
+    // Medido: 0x7547a0 (widget 0xcb4d40), 0x756a28 (0xcb5e00), 0x756ab0 (0xca7300).
+    PS2Runtime::RecompiledFunction g_orig7547a0 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig756a28 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig756ab0 = nullptr;
+    // 2026-10-19 (hito 1.4 / A/B v86): GetAsset de fuente y carga de texturas del widget.
+    PS2Runtime::RecompiledFunction g_orig4f7d40 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig550ad0 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig5510d0 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig551d60 = nullptr;
+    // 2026-10-19 (hito 1.4): cadena del render de texto (por donde debería llegar a 0x551d60).
+    PS2Runtime::RecompiledFunction g_orig7419c8 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig5530f0 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig553f20 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig551250 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig551390 = nullptr;
+    // 2026-10-19 (hito 1.4): bind/registro de texturas (¿alguien pide registrar los glifos?).
+    PS2Runtime::RecompiledFunction g_orig700690 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig6fef28 = nullptr;
+    // 2026-10-19 (hito 1.4): gates internos de FUN_005530f0 (render de widget de texto).
+    PS2Runtime::RecompiledFunction g_orig6d4f78 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig5507b0 = nullptr;
+    // 2026-10-19 (hito 1.4 / v88): decisión de modo de video y ResetGraph recomplido.
+    PS2Runtime::RecompiledFunction g_orig6f0d68 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig4d0b40 = nullptr;
+    // 2026-10-19 (hito 1.4 / v88): selección de dirección de la cámara UI (0x7a7f20) y
+    // construcción de la base ortonormal (0x6d0280).
+    PS2Runtime::RecompiledFunction g_orig7a7f20 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig6d0280 = nullptr;
+    // 2026-10-19 (hito 1.4 / v88): corrección de la matriz de cámara UI reflejada.
+    PS2Runtime::RecompiledFunction g_orig6d3620 = nullptr;
+    // 2026-10-19 (hito 1.4 / v90): builder real de planos ortográficos UI (type != 1).
+    PS2Runtime::RecompiledFunction g_orig6d40c0 = nullptr;
+    // 2026-10-19: log directo al entrar a 0x83d290 (la llamada del descriptor de tarea; 0 ejec).
+    PS2Runtime::RecompiledFunction g_orig83d290 = nullptr;
     void triageLoadGs(PS2Runtime *runtime);
     void triage6e45d8wrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -4505,6 +4555,11 @@ namespace
             const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
             RUNTIME_LOG("[ui-clear] UI_Manager::ClearAll ENTER ra=0x" << std::hex << ra << std::dec);
             if (g_orig6db0d0 != nullptr) g_orig6db0d0(rdram, ctx, runtime);
+            {
+                uint32_t headAfter = 0u;
+                std::memcpy(&headAfter, rdram + 0x00A88874u, 4);
+                RUNTIME_LOG("[ui-clear] AFTER head=0x" << std::hex << headAfter << std::dec);
+            }
         };
         if (g_orig6db0d0 != nullptr) runtime.replaceFunction(0x6db0d0u, trace6db0d0wrap);
 
@@ -4514,9 +4569,27 @@ namespace
             const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
             const uint32_t a2 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6]));
             const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            // 2026-10-19 (hito): en el real el manager esta en 0xA887B8 y su centinela en manager+0xBC
+            // (0xA88874). Si el manager destino NO es el global, miramos SU centinela para saber si la
+            // lista que vigila FUN_0083d290 es otra instancia.
+            uint32_t sentNext = 0u, sentPrev = 0u;
+            if (a0 >= 0x10000u && (a0 + 0xBCu + 8u) < 32u * 1024u * 1024u)
+            {
+                std::memcpy(&sentNext, rdram + ((a0 + 0xBCu) & 0x01FFFFFFu), 4);
+                std::memcpy(&sentPrev, rdram + ((a0 + 0xBCu + 4u) & 0x01FFFFFFu), 4);
+            }
             RUNTIME_LOG("[ui-insert] 0x6d6a80 mgr=0x" << std::hex << a0 << " node=0x" << a1
-                        << " widget=0x" << a2 << " ra=0x" << ra << std::dec);
+                        << " widget=0x" << a2 << " ra=0x" << ra
+                        << std::dec << " global=" << ((a0 == 0x00A887B8u) ? 1 : 0)
+                        << std::hex << " sentNext=0x" << sentNext << " sentPrev=0x" << sentPrev
+                        << std::dec);
             if (g_orig6d6a80 != nullptr) g_orig6d6a80(rdram, ctx, runtime);
+            {
+                // 0x6d6a80 inserta SIEMPRE en el centinela global 0xA88874 (lo hardcodea en 0x6d6aa0).
+                uint32_t headAfter = 0u;
+                std::memcpy(&headAfter, rdram + 0x00A88874u, 4);
+                RUNTIME_LOG("[ui-insert] AFTER head=0x" << std::hex << headAfter << std::dec);
+            }
         };
         if (g_orig6d6a80 != nullptr) runtime.replaceFunction(0x6d6a80u, trace6d6a80wrap);
 
@@ -4537,6 +4610,570 @@ namespace
             if (g_orig6d51b0 != nullptr) g_orig6d51b0(rdram, ctx, runtime);
         };
         if (g_orig6d51b0 != nullptr) runtime.replaceFunction(0x6d51b0u, trace6d51b0wrap);
+
+        // 2026-10-19 (hito): ¿corre el constructor de widgets del selector?
+        //   0x805550: invocado por vtable+0x2DC desde 0x83DD74 (substate 2 de FUN_0083dc40).
+        //   0x804c50: itera la tabla de descriptores y llama a InsertWidget (0x6d6290/0x6d6a80).
+        // A/B: si 0x805550 NUNCA entra, el substate 2 no llega al ctor. Si entra y no sigue un
+        // [ui-insert], se confirma el early-return por recurso faltante (beqz $a0 en 0x804c98).
+        g_orig805550 = runtime.lookupFunction(0x805550u);
+        static auto trace805550wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            static uint32_t s_n55 = 0u;
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+            const uint32_t a2 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            const bool logIt = (s_n55++ < 40u);
+            if (logIt)
+                RUNTIME_LOG("[ui-widget] 0x805550 ENTER a0=0x" << std::hex << a0 << " a1=0x" << a1
+                            << " a2=0x" << a2 << " ra=0x" << ra << std::dec);
+            if (g_orig805550 != nullptr) g_orig805550(rdram, ctx, runtime);
+            if (logIt)
+                RUNTIME_LOG("[ui-widget] 0x805550 EXIT pc=0x" << std::hex << ctx->pc
+                            << " v0=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[2])) << std::dec);
+        };
+        if (g_orig805550 != nullptr) runtime.replaceFunction(0x805550u, trace805550wrap);
+
+        g_orig804c50 = runtime.lookupFunction(0x804c50u);
+        static auto trace804c50wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            static uint32_t s_n4c = 0u;
+            const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+            const uint32_t a2 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6]));
+            const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+            const bool logIt = (s_n4c++ < 40u);
+            if (logIt)
+                RUNTIME_LOG("[ui-widget] 0x804c50 ENTER a0=0x" << std::hex << a0 << " a1=0x" << a1
+                            << " a2=0x" << a2 << " ra=0x" << ra << std::dec);
+            if (g_orig804c50 != nullptr) g_orig804c50(rdram, ctx, runtime);
+            if (logIt)
+                RUNTIME_LOG("[ui-widget] 0x804c50 EXIT pc=0x" << std::hex << ctx->pc
+                            << " v0=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[2])) << std::dec);
+        };
+        if (g_orig804c50 != nullptr) runtime.replaceFunction(0x804c50u, trace804c50wrap);
+
+        // 2026-10-19 (hito): ¿que ve la rutina de DIBUJO del selector? Si al entrar el centinela
+        // 0xA88874 sigue auto-apuntandose, dibuja 0 widgets aunque los inserts hayan ocurrido.
+        g_orig83d290 = runtime.lookupFunction(0x83d290u);
+        static auto trace83d290wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            static uint32_t s_nDraw = 0u;
+            static uint32_t s_lastHead = 0xFFFFFFFFu;
+            uint32_t head = 0u;
+            std::memcpy(&head, rdram + 0x00A88874u, 4);
+            // solo loguear en los cambios de cabeza (evita inundar el log cada frame)
+            if (head != s_lastHead && s_nDraw < 400u) {
+                ++s_nDraw;
+                s_lastHead = head;
+                const uint32_t ra = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+                RUNTIME_LOG("[ui-draw] head=0x" << std::hex << head << " ra=0x" << ra
+                            << " n=" << std::dec << s_nDraw);
+            }
+            if (g_orig83d290 != nullptr) g_orig83d290(rdram, ctx, runtime);
+        };
+        if (g_orig83d290 != nullptr) runtime.replaceFunction(0x83d290u, trace83d290wrap);
+
+        // 2026-10-19 (hito): ¿pasa el render por-widget? Gate 1: 0x6db0d0 itera la cola 0xA88874 y
+        // llama a 0x6daef0 por widget. Gate 2: bit 0 de `widget+3` (visible). Gate 3: lista de
+        // comandos en `widget+0x90` (si esta vacia no hay primitivas). Logueamos eso al entrar.
+        g_orig6daef0 = runtime.lookupFunction(0x6daef0u);
+        static auto trace6daef0wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            static const bool s_uiCbLog = []() {
+                const char *e = std::getenv("SWORD_UI_CB_LOG");
+                return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+            }();
+            static uint32_t s_nR = 0u;
+            const uint32_t w = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            const uint32_t prevWidget = g_swordUiCurWidget;
+            if (s_uiCbLog) g_swordUiCurWidget = w;
+            if (w >= 0x10000u && (w + 0x100u) < 32u * 1024u * 1024u && s_nR < 60u) {
+                const uint8_t flags = rdram[((w + 3u) & 0x01FFFFFFu)];
+                uint32_t rlHead = 0u;
+                std::memcpy(&rlHead, rdram + ((w + 0x90u) & 0x01FFFFFFu), 4);
+                const bool empty = (rlHead == ((w + 0x90u) & 0x01FFFFFFu));
+                ++s_nR;
+                RUNTIME_LOG("[ui-render] n=" << std::dec << s_nR << " widget=0x" << std::hex << w
+                            << " flags=0x" << static_cast<uint32_t>(flags)
+                            << " visible=" << ((flags & 1u) ? 1 : 0)
+                            << " rlHead=0x" << rlHead << " rlEmpty=" << (empty ? 1 : 0)
+                            << std::dec);
+            }
+            if (g_orig6daef0 != nullptr) g_orig6daef0(rdram, ctx, runtime);
+            g_swordUiCurWidget = prevWidget;
+        };
+        if (g_orig6daef0 != nullptr) runtime.replaceFunction(0x6daef0u, trace6daef0wrap);
+
+        // 2026-10-19 (hito 1.2): atribuir los prims que emite cada callback de render. El tag lo lee
+        // GSCpuBackend::DrawPrimitive (SWORD_UI_CB_PRIMS=1). Asi sabemos que PRIM/TEX0/UV/color sale
+        // de 0x7547a0 / 0x756a28 / 0x756ab0 y no de otra parte de la escena.
+#define SWORD_UI_CB_TRACE(NAME, ADDR, ORIG)                                                   \
+        ORIG = runtime.lookupFunction(ADDR);                                                  \
+        static auto trace##NAME##wrap = [](uint8_t *rdram, R5900Context *ctx,                  \
+                                           PS2Runtime *runtime) {                              \
+            static const bool s_uiCbLog = []() {                                               \
+                const char *e = std::getenv("SWORD_UI_CB_LOG");                                \
+                return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;                 \
+            }();                                                                               \
+            static uint32_t s_enter = 0u;                                                      \
+            const uint32_t prevTag = g_swordUiCbTag;                                           \
+            if (s_uiCbLog)                                                                     \
+            {                                                                                  \
+                g_swordUiCbTag = ADDR;                                                         \
+                if (s_enter++ < 8u || (s_enter % 1000u) == 0u)                                 \
+                    RUNTIME_LOG("[ui-cb-enter] cb=0x" << std::hex << ADDR                      \
+                                << " a0=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4])) \
+                                << " a1=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5])) \
+                                << " ra=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) \
+                                << std::dec << " n=" << s_enter << "\n");                       \
+            }                                                                                  \
+            if (ORIG != nullptr) ORIG(rdram, ctx, runtime);                                    \
+            g_swordUiCbTag = prevTag;                                                          \
+        };                                                                                     \
+        if (ORIG != nullptr) runtime.replaceFunction(ADDR, trace##NAME##wrap)
+        SWORD_UI_CB_TRACE(f7547a0, 0x7547a0u, g_orig7547a0);
+        SWORD_UI_CB_TRACE(f756a28, 0x756a28u, g_orig756a28);
+        SWORD_UI_CB_TRACE(f756ab0, 0x756ab0u, g_orig756ab0);
+#undef SWORD_UI_CB_TRACE
+
+        // 2026-10-19 (hito 1.4 / A/B v86): ¿GetAsset(0x6020800) devuelve NULL en FUN_00550ad0?
+        // SWORD_FONT_ASSET=1. Sin el env no se instala nada (comportamiento por defecto intacto).
+        if (std::getenv("SWORD_FONT_ASSET") != nullptr)
+        {
+            g_orig4f7d40 = runtime.lookupFunction(0x4f7d40u);
+            static auto trace4f7d40 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                (void)rdram; (void)runtime;
+                const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                static uint32_t s_n = 0u;
+                const bool font = (a1 == 0x06020800u);
+                const bool logIt = font || (s_n++ < 24u);
+                if (logIt)
+                    RUNTIME_LOG("[font:get_asset] ENTER mgr=0x" << std::hex << a0 << " id=0x" << a1 << std::dec);
+                if (g_orig4f7d40 != nullptr) g_orig4f7d40(rdram, ctx, runtime);
+                if (logIt)
+                    RUNTIME_LOG("[font:get_asset] EXIT id=0x" << std::hex << a1
+                                << " result=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[2]))
+                                << std::dec);
+            };
+            if (g_orig4f7d40 != nullptr) runtime.replaceFunction(0x4f7d40u, trace4f7d40);
+
+            g_orig550ad0 = runtime.lookupFunction(0x550ad0u);
+            static auto trace550ad0 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t widget = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t idx = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                RUNTIME_LOG("[font:load] ENTER widget=0x" << std::hex << widget
+                            << " idx=0x" << idx << std::dec);
+                if (g_orig550ad0 != nullptr) g_orig550ad0(rdram, ctx, runtime);
+                uint32_t fa = 0u, tex = 0u, cnt = 0u;
+                uint32_t e0 = 0u, e1 = 0u, e2 = 0u, e3 = 0u;
+                if (widget >= 0x10000u && widget + 0x180u < 32u * 1024u * 1024u) {
+                    std::memcpy(&fa, rdram + ((widget + 0x174u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&tex, rdram + ((widget + 0x178u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&cnt, rdram + ((widget + 0x17Cu) & 0x01FFFFFFu), 4);
+                    if (tex >= 0x10000u && tex + 0x10u < 32u * 1024u * 1024u) {
+                        std::memcpy(&e0, rdram + (tex & 0x01FFFFFFu), 4);
+                        std::memcpy(&e1, rdram + ((tex + 4u) & 0x01FFFFFFu), 4);
+                        std::memcpy(&e2, rdram + ((tex + 8u) & 0x01FFFFFFu), 4);
+                        std::memcpy(&e3, rdram + ((tex + 12u) & 0x01FFFFFFu), 4);
+                    }
+                }
+                RUNTIME_LOG("[font:load] EXIT widget=0x" << std::hex << widget
+                            << " font_asset=0x" << fa << " tex_ptr=0x" << tex
+                            << " count=" << std::dec << cnt
+                            << std::hex << " e0=0x" << e0 << " e1=0x" << e1
+                            << " e2=0x" << e2 << " e3=0x" << e3 << std::dec);
+            };
+            if (g_orig550ad0 != nullptr) runtime.replaceFunction(0x550ad0u, trace550ad0);
+
+            g_orig5510d0 = runtime.lookupFunction(0x5510d0u);
+            static auto trace5510d0 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                static uint32_t s_n = 0u;
+                RUNTIME_LOG("[font:textures] ENTER n=" << ++s_n
+                            << " widget=0x" << std::hex
+                            << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4])) << std::dec);
+                if (g_orig5510d0 != nullptr) g_orig5510d0(rdram, ctx, runtime);
+            };
+            if (g_orig5510d0 != nullptr) runtime.replaceFunction(0x5510d0u, trace5510d0);
+
+            // Gate del renderizador de texto: 0x551f6c (font_asset==0) y 0x551f7c (count < index).
+            g_orig551d60 = runtime.lookupFunction(0x551d60u);
+            static auto trace551d60 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t widget = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t glyph = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                uint32_t fa = 0u, arr = 0u, cnt = 0u, idx = 0u;
+                if (widget >= 0x10000u && widget + 0x180u < 32u * 1024u * 1024u) {
+                    std::memcpy(&fa, rdram + ((widget + 0x174u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&arr, rdram + ((widget + 0x178u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&cnt, rdram + ((widget + 0x17Cu) & 0x01FFFFFFu), 4);
+                }
+                if (glyph >= 0x10000u && glyph + 4u < 32u * 1024u * 1024u)
+                    idx = rdram[(glyph + 2u) & 0x01FFFFFFu];
+                // A/B (diagnóstico, no fix): el widget real tiene +0x100=24.0 y +0x104=6; el nuestro
+                // 0.0 y 3. Si forzarlos desbloquea el layout, el problema es el estilo no inicializado.
+                static const bool s_styleFix = []() {
+                    const char *e = std::getenv("SWORD_TEXT_STYLE_FIX");
+                    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+                }();
+                if (s_styleFix && widget >= 0x10000u && widget + 0x108u < 32u * 1024u * 1024u) {
+                    const uint32_t styleBits = 0x41C00000u; // 24.0f
+                    std::memcpy(rdram + ((widget + 0x100u) & 0x01FFFFFFu), &styleBits, 4);
+                    rdram[(widget + 0x104u) & 0x01FFFFFFu] = 6u;
+                }
+                const bool bad = (fa == 0u) || (cnt < idx);
+                uint32_t f100 = 0u, f104 = 0u, textptr = 0u, g1c = 0u;
+                if (widget >= 0x10000u && widget + 0x180u < 32u * 1024u * 1024u) {
+                    std::memcpy(&f100, rdram + ((widget + 0x100u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&f104, rdram + ((widget + 0x104u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&textptr, rdram + ((widget + 0x10Cu) & 0x01FFFFFFu), 4);
+                    std::memcpy(&g1c, rdram + ((widget + 0x1Cu) & 0x01FFFFFFu), 4);
+                }
+                static uint32_t s_n = 0u, s_bad = 0u;
+                if (s_n++ < 16u || (bad && s_bad++ < 16u))
+                    RUNTIME_LOG("[text:gate] widget=0x" << std::hex << widget
+                                << " glyph=0x" << glyph
+                                << " font_asset=0x" << fa
+                                << " arr=0x" << arr
+                                << " text=0x" << textptr
+                                << " f100=0x" << f100
+                                << " f104=0x" << f104
+                                << " g1c=0x" << g1c
+                                << std::dec << " count=" << cnt
+                                << " idx=" << idx
+                                << " bad=" << (bad ? 1 : 0) << "\n");
+                if (g_orig551d60 != nullptr) g_orig551d60(rdram, ctx, runtime);
+            };
+            if (g_orig551d60 != nullptr) runtime.replaceFunction(0x551d60u, trace551d60);
+
+            // 2026-10-19 (hito 1.4): cadena del render de texto. ¿Hasta dónde llega?
+#define SWORD_TEXT_TRACE(NAME, ADDR, ORIG)                                              \
+            ORIG = runtime.lookupFunction(ADDR);                                        \
+            static auto trace##NAME##wrap = [](uint8_t *rdram, R5900Context *ctx,        \
+                                               PS2Runtime *runtime) {                    \
+                static uint32_t s_n = 0u;                                                \
+                if (s_n++ < 8u || (s_n % 1000u) == 0u)                                   \
+                    RUNTIME_LOG("[text:chain] " #NAME " ENTER n=" << s_n                 \
+                                << " a0=0x" << std::hex                                  \
+                                << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]))    \
+                                << " a1=0x"                                              \
+                                << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]))    \
+                                << " cb=0x" << std::hex << g_swordUiCbTag                \
+                                << std::dec);                                            \
+                if (ORIG != nullptr) ORIG(rdram, ctx, runtime);                          \
+            };                                                                           \
+            if (ORIG != nullptr) runtime.replaceFunction(ADDR, trace##NAME##wrap)
+            SWORD_TEXT_TRACE(f7419c8, 0x7419c8u, g_orig7419c8);
+            SWORD_TEXT_TRACE(f5530f0, 0x5530f0u, g_orig5530f0);
+            SWORD_TEXT_TRACE(f553f20, 0x553f20u, g_orig553f20);
+            SWORD_TEXT_TRACE(f551250, 0x551250u, g_orig551250);
+            SWORD_TEXT_TRACE(f551390, 0x551390u, g_orig551390);
+#undef SWORD_TEXT_TRACE
+
+            // 2026-10-19 (hito 1.4): bind (0x700690) y registro en la tabla (0x6fef28). Dedupe por
+            // descriptor para ver si los glifos de fuente llegan a pedir textura.
+            g_orig700690 = runtime.lookupFunction(0x700690u);
+            static auto trace700690 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t desc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                static uint32_t seen[64] = {0};
+                static uint32_t nseen = 0u;
+                bool found = false;
+                for (uint32_t i = 0; i < nseen; ++i) if (seen[i] == desc) { found = true; break; }
+                if (!found && nseen < 64u) { seen[nseen++] = desc; }
+                const bool isNew = !found;
+                uint64_t tex0 = 0ull;
+                if (desc >= 0x10000u && desc + 0x48u < 32u * 1024u * 1024u)
+                    std::memcpy(&tex0, rdram + ((desc + 0x3Cu) & 0x01FFFFFFu), 8);
+                if (isNew)
+                    RUNTIME_LOG("[text:bind] NEW desc=0x" << std::hex << desc
+                                << " tex0=0x" << tex0 << std::dec
+                                << " nseen=" << nseen << "\n");
+                if (g_orig700690 != nullptr) g_orig700690(rdram, ctx, runtime);
+            };
+            if (g_orig700690 != nullptr) runtime.replaceFunction(0x700690u, trace700690);
+
+            g_orig6fef28 = runtime.lookupFunction(0x6fef28u);
+            static auto trace6fef28 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t desc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                static uint32_t seen[64] = {0};
+                static uint32_t nseen = 0u;
+                bool found = false;
+                for (uint32_t i = 0; i < nseen; ++i) if (seen[i] == desc) { found = true; break; }
+                if (!found && nseen < 64u) seen[nseen++] = desc;
+                if (!found)
+                    RUNTIME_LOG("[text:register] NEW desc=0x" << std::hex << desc
+                                << std::dec << " nseen=" << nseen << "\n");
+                if (g_orig6fef28 != nullptr) g_orig6fef28(rdram, ctx, runtime);
+                if (!found) {
+                    uint32_t entry = 0u, vram = 0u, size = 0u;
+                    if (desc >= 0x10000u && desc + 0x60u < 32u * 1024u * 1024u) {
+                        std::memcpy(&entry, rdram + ((desc + 0x58u) & 0x01FFFFFFu), 4);
+                        if (entry >= 0x10000u && entry + 12u < 32u * 1024u * 1024u) {
+                            std::memcpy(&vram, rdram + ((entry + 4u) & 0x01FFFFFFu), 4);
+                            std::memcpy(&size, rdram + ((entry + 8u) & 0x01FFFFFFu), 4);
+                        }
+                    }
+                    RUNTIME_LOG("[text:register] AFTER desc=0x" << std::hex << desc
+                                << " entry=0x" << entry << " vram=0x" << vram
+                                << " size=0x" << size << std::dec << "\n");
+                }
+            };
+            if (g_orig6fef28 != nullptr) runtime.replaceFunction(0x6fef28u, trace6fef28);
+
+            // 2026-10-19 (hito 1.4): gates internos de 0x5530f0. Slot +0xBC = 0x5507b0 y
+            // FUN_006d4f78; si cualquiera devuelve 0, el widget salta a 0x553ee4 sin dibujar texto.
+            g_orig5507b0 = runtime.lookupFunction(0x5507b0u);
+            static auto trace5507b0 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                static uint32_t s_n = 0u;
+                const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const bool logIt = (s_n++ < 16u);
+                if (logIt) RUNTIME_LOG("[text:gateB] ENTER widget=0x" << std::hex << a0 << std::dec);
+                if (g_orig5507b0 != nullptr) g_orig5507b0(rdram, ctx, runtime);
+                if (logIt)
+                    RUNTIME_LOG("[text:gateB] EXIT v0=" << static_cast<int32_t>(_mm_cvtsi128_si32(ctx->r[2])));
+            };
+            if (g_orig5507b0 != nullptr) runtime.replaceFunction(0x5507b0u, trace5507b0);
+
+            g_orig6d4f78 = runtime.lookupFunction(0x6d4f78u);
+            static auto trace6d4f78 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                static uint32_t s_n = 0u;
+                const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                const uint32_t raIn = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+                const bool logIt = (s_n++ < 8u);
+                if (logIt)
+                {
+                    float m[4] = {0}, v[4] = {0};
+                    if (a0 >= 0x10000u && a0 + 0xA4u < 32u * 1024u * 1024u)
+                        std::memcpy(m, rdram + ((a0 + 0x94u) & 0x01FFFFFFu), 16);
+                    if (a1 >= 0x10000u && a1 + 0x10u < 32u * 1024u * 1024u)
+                        std::memcpy(v, rdram + (a1 & 0x01FFFFFFu), 16);
+                    RUNTIME_LOG("[text:gateC] ENTER a0=0x" << std::hex << a0 << " a1=0x" << a1
+                                << " ra=0x" << raIn
+                                << std::dec
+                                << " m=(" << m[0] << "," << m[1] << "," << m[2] << "," << m[3] << ")"
+                                << " v=(" << v[0] << "," << v[1] << "," << v[2] << "," << v[3] << ")");
+                    if (a0 >= 0x10000u && a0 + 0xF8u < 32u * 1024u * 1024u) {
+                        for (uint32_t i = 0; i < 6u; ++i) {
+                            float p[4] = {0, 0, 0, 0};
+                            std::memcpy(p, rdram + ((a0 + 0x94u + i * 0x14u) & 0x01FFFFFFu), 16);
+                            RUNTIME_LOG("[text:plane] p" << i << "=(" << p[0] << "," << p[1]
+                                        << "," << p[2] << "," << p[3] << ")");
+                        }
+                    }
+                }
+                // Test B (v87): corregir el signo de la distancia del plano vertical r3 (a0+0xD0+0xC)
+                // en el call site del widget de texto, sin forzar el retorno. Diagnóstico.
+                static const bool s_fixPlanes = []() {
+                    const char *e = std::getenv("SWORD_TEXT_FIX_PLANES");
+                    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+                }();
+                if (s_fixPlanes && raIn == 0x55322Cu && a0 >= 0x10000u &&
+                    a0 + 0xE0u < 32u * 1024u * 1024u) {
+                    const uint32_t dAddr = (a0 + 0xDCu) & 0x01FFFFFFu;
+                    float d = 0.0f;
+                    std::memcpy(&d, rdram + dAddr, 4);
+                    if (d < 0.0f) {
+                        d = -d;
+                        std::memcpy(rdram + dAddr, &d, 4);
+                        RUNTIME_LOG("[frustum:fix] plane3.D -> " << d << "\n");
+                    }
+                }
+                if (g_orig6d4f78 != nullptr) g_orig6d4f78(rdram, ctx, runtime);
+                // Test A (v87): forzar el gate SOLO en el call site del widget de texto (ra=0x55322C).
+                static const bool s_forceFit = []() {
+                    const char *e = std::getenv("SWORD_TEXT_FORCE_FIT");
+                    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+                }();
+                if (s_forceFit && raIn == 0x55322Cu) {
+                    ctx->r[2] = _mm_cvtsi64_si128(1);
+                    RUNTIME_LOG("[text:gateC] FORCED v0=1 at ra=0x55322C\n");
+                }
+                if (logIt)
+                    RUNTIME_LOG("[text:gateC] EXIT v0=" << static_cast<int32_t>(_mm_cvtsi128_si32(ctx->r[2])));
+            };
+            if (g_orig6d4f78 != nullptr) runtime.replaceFunction(0x6d4f78u, trace6d4f78);
+
+            // 2026-10-19 (hito 1.4 / v88): modo de video del selector. FUN_006f0d68 lee
+            // *(0xA8DAD0+0x24)&2 y omode en +0x32; si bit1 -> PAL (interlace=1, ffmode=0).
+            g_orig6f0d68 = runtime.lookupFunction(0x6f0d68u);
+            static auto trace6f0d68 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                uint32_t flags = 0u;
+                std::memcpy(&flags, rdram + 0x00A8DAF4u, 4);
+                const uint8_t omode = rdram[0x00A8DB02u];
+                RUNTIME_LOG("[disp:mode] ENTER flags=0x" << std::hex << flags
+                            << " omode=" << std::dec << static_cast<uint32_t>(omode)
+                            << " ra=0x" << std::hex
+                            << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) << std::dec);
+                static const bool s_forcePal = []() {
+                    const char *e = std::getenv("SWORD_FORCE_UI_PAL");
+                    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+                }();
+                if (s_forcePal) {
+                    flags |= 2u;
+                    std::memcpy(rdram + 0x00A8DAF4u, &flags, 4);
+                    rdram[0x00A8DB02u] = 3u;
+                    RUNTIME_LOG("[disp:mode] FORCED PAL flags=0x" << std::hex << flags
+                                << std::dec << " omode=3");
+                }
+                if (g_orig6f0d68 != nullptr) g_orig6f0d68(rdram, ctx, runtime);
+                uint64_t smode = 0ull;
+                std::memcpy(&smode, rdram + 0x00A8D0B8u, 8);
+                RUNTIME_LOG("[disp:mode] EXIT smode=0x" << std::hex << smode << std::dec);
+            };
+            if (g_orig6f0d68 != nullptr) runtime.replaceFunction(0x6f0d68u, trace6f0d68);
+
+            g_orig4d0b40 = runtime.lookupFunction(0x4d0b40u);
+            static auto trace4d0b40 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t mode = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t interlace = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                const uint32_t omode = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[6]));
+                const uint32_t ffmode = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[7]));
+                RUNTIME_LOG("[gs:reset-recomp] mode=" << mode << " interlace=" << interlace
+                            << " omode=" << omode << " ffmode=" << ffmode
+                            << " ra=0x" << std::hex
+                            << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) << std::dec);
+                if (g_orig4d0b40 != nullptr) g_orig4d0b40(rdram, ctx, runtime);
+            };
+            if (g_orig4d0b40 != nullptr) runtime.replaceFunction(0x4d0b40u, trace4d0b40);
+
+            // 2026-10-19 (hito 1.4 / v88): inputs de la selección de dirección de cámara UI.
+            // 0x7a7f74: mode = (*(*(a0+0x24)+0x1B0) >> 8) & 0xFF; 0x7a7f8c: id = *(a0+0x94).
+            g_orig7a7f20 = runtime.lookupFunction(0x7a7f20u);
+            static auto trace7a7f20 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                static uint32_t s_n = 0u;
+                if (s_n++ < 16u && a0 >= 0x10000u && a0 + 0x1A0u < 32u * 1024u * 1024u) {
+                    uint32_t cfg = 0u, flags = 0u, id = 0u;
+                    std::memcpy(&cfg, rdram + ((a0 + 0x24u) & 0x01FFFFFFu), 4);
+                    if (cfg >= 0x10000u && cfg + 0x1B4u < 32u * 1024u * 1024u)
+                        std::memcpy(&flags, rdram + ((cfg + 0x1B0u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&id, rdram + ((a0 + 0x94u) & 0x01FFFFFFu), 4);
+                    RUNTIME_LOG("[cam:dir] a0=0x" << std::hex << a0
+                                << " cfg=0x" << cfg << " flags=0x" << flags
+                                << " mode=" << std::dec << ((flags >> 8) & 0xFFu)
+                                << " id=0x" << std::hex << id << std::dec << "\n");
+                }
+                if (g_orig7a7f20 != nullptr) g_orig7a7f20(rdram, ctx, runtime);
+            };
+            if (g_orig7a7f20 != nullptr) runtime.replaceFunction(0x7a7f20u, trace7a7f20);
+
+            g_orig6d0280 = runtime.lookupFunction(0x6d0280u);
+            static auto trace6d0280 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                const uint32_t a1 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[5]));
+                if (a1 >= 0x10000u && a1 + 0x10u < 32u * 1024u * 1024u) {
+                    float v[3] = {0, 0, 0};
+                    std::memcpy(v, rdram + (a1 & 0x01FFFFFFu), 12);
+                    uint32_t k0 = 0u, k1 = 0u, k2 = 0u;
+                    std::memcpy(&k0, &v[0], 4); std::memcpy(&k1, &v[1], 4); std::memcpy(&k2, &v[2], 4);
+                    static uint32_t seen[8][3] = {{0}};
+                    static uint32_t nSeen = 0u;
+                    bool newDir = true;
+                    for (uint32_t i = 0; i < nSeen; ++i)
+                        if (seen[i][0] == k0 && seen[i][1] == k1 && seen[i][2] == k2) { newDir = false; break; }
+                    if (newDir && nSeen < 8u) { seen[nSeen][0] = k0; seen[nSeen][1] = k1; seen[nSeen][2] = k2; ++nSeen; }
+                    if (newDir)
+                        RUNTIME_LOG("[cam:dir] basis a0=0x" << std::hex << a0
+                                    << " dir=(" << std::dec << v[0] << "," << v[1] << "," << v[2] << ")\n");
+                }
+                if (g_orig6d0280 != nullptr) g_orig6d0280(rdram, ctx, runtime);
+            };
+            if (g_orig6d0280 != nullptr) runtime.replaceFunction(0x6d0280u, trace6d0280);
+
+            // 2026-10-19 (hito 1.4 / v88): la matriz de cámara UI está reflejada (Y = -1.142857
+            // vs +1.142857 real). Antes de construir los planos, corregir el signo de la fila Y
+            // en el nodo de matriz: local en node+0x10 (Y en +0x24) y world en node+0x50 (Y en +0x64).
+            // Env SWORD_UI_CAM_FIX=1. Diagnóstico de causa raíz.
+            g_orig6d3620 = runtime.lookupFunction(0x6d3620u);
+            static auto trace6d3620 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                static const bool s_fix = []() {
+                    const char *e = std::getenv("SWORD_UI_CAM_FIX");
+                    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+                }();
+                if (s_fix) {
+                    const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                    uint32_t node = 0u;
+                    if (a0 >= 0x10000u && a0 + 8u < 32u * 1024u * 1024u)
+                        std::memcpy(&node, rdram + ((a0 + 4u) & 0x01FFFFFFu), 4);
+                    // Log una vez por cámara distinta (no limitar a las primeras 6: el loop del
+                    // scene graph recorre 3D y UI en serie).
+                    static uint32_t seenCam[8] = {0};
+                    static uint32_t nSeenCam = 0u;
+                    bool newCam = true;
+                    for (uint32_t i = 0; i < nSeenCam; ++i)
+                        if (seenCam[i] == a0) { newCam = false; break; }
+                    if (newCam && nSeenCam < 8u) seenCam[nSeenCam++] = a0;
+                    if (newCam) {
+                        float ly = 0.0f, wy = 0.0f, hw = 0.0f, hh = 0.0f;
+                        if (node >= 0x10000u && node + 0x70u < 32u * 1024u * 1024u) {
+                            std::memcpy(&ly, rdram + ((node + 0x24u) & 0x01FFFFFFu), 4);
+                            std::memcpy(&wy, rdram + ((node + 0x64u) & 0x01FFFFFFu), 4);
+                        }
+                        if (a0 + 0x70u < 32u * 1024u * 1024u) {
+                            std::memcpy(&hw, rdram + ((a0 + 0x68u) & 0x01FFFFFFu), 4);
+                            std::memcpy(&hh, rdram + ((a0 + 0x6Cu) & 0x01FFFFFFu), 4);
+                        }
+                        RUNTIME_LOG("[frustum:build] cam=0x" << std::hex << a0
+                                    << " node=0x" << node << std::dec
+                                    << " halfW=" << hw << " halfH=" << hh
+                                    << " localY=" << ly << " worldY=" << wy << "\n");
+                    }
+                    if (node >= 0x10000u && node + 0x70u < 32u * 1024u * 1024u) {
+                        for (uint32_t off : {0x24u, 0x64u}) {
+                            const uint32_t addr = (node + off) & 0x01FFFFFFu;
+                            float v = 0.0f;
+                            std::memcpy(&v, rdram + addr, 4);
+                            if (v < 0.0f) {
+                                v = -v;
+                                std::memcpy(rdram + addr, &v, 4);
+                                RUNTIME_LOG("[cam:fix] node=0x" << std::hex << node
+                                            << " +0x" << off << " -> +" << std::dec << v << "\n");
+                            }
+                        }
+                    }
+                }
+                if (g_orig6d3620 != nullptr) g_orig6d3620(rdram, ctx, runtime);
+            };
+            if (g_orig6d3620 != nullptr) runtime.replaceFunction(0x6d3620u, trace6d3620);
+
+            // 2026-10-19 (hito 1.4 / v90): builder ortográfico real de la cámara UI (type != 1).
+            // Diagnóstico env-gated (SWORD_FONT_ASSET); la causa raíz se corrigió en el traductor.
+            g_orig6d40c0 = runtime.lookupFunction(0x6d40c0u);
+            static auto trace6d40c0 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                const uint32_t cam = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+                uint32_t node = 0u;
+                float hw = 0.0f, hh = 0.0f, wy = 0.0f;
+                if (cam >= 0x10000u && cam + 0x110u < 32u * 1024u * 1024u) {
+                    std::memcpy(&node, rdram + ((cam + 4u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&hw, rdram + ((cam + 0x68u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&hh, rdram + ((cam + 0x6Cu) & 0x01FFFFFFu), 4);
+                    if (node >= 0x10000u && node + 0x70u < 32u * 1024u * 1024u)
+                        std::memcpy(&wy, rdram + ((node + 0x64u) & 0x01FFFFFFu), 4);
+                }
+                static uint32_t seen[4] = {0};
+                static uint32_t nSeen = 0u;
+                bool newCam = true;
+                for (uint32_t i = 0; i < nSeen; ++i)
+                    if (seen[i] == cam) { newCam = false; break; }
+                if (newCam && nSeen < 4u) seen[nSeen++] = cam;
+                if (newCam)
+                    RUNTIME_LOG("[frustum:ortho] cam=0x" << std::hex << cam << " node=0x" << node
+                                << std::dec << " halfW=" << hw << " halfH=" << hh
+                                << " worldY=" << wy << "\n");
+                if (g_orig6d40c0 != nullptr) g_orig6d40c0(rdram, ctx, runtime);
+                if (newCam && cam >= 0x10000u && cam + 0x110u < 32u * 1024u * 1024u) {
+                    float p2x = 0, p2d = 0, p3d = 0, p4x = 0, p4d = 0, p5d = 0;
+                    std::memcpy(&p2x, rdram + ((cam + 0xBCu) & 0x01FFFFFFu), 4);
+                    std::memcpy(&p2d, rdram + ((cam + 0xC8u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&p3d, rdram + ((cam + 0xDCu) & 0x01FFFFFFu), 4);
+                    std::memcpy(&p4x, rdram + ((cam + 0xE4u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&p4d, rdram + ((cam + 0xF0u) & 0x01FFFFFFu), 4);
+                    std::memcpy(&p5d, rdram + ((cam + 0x104u) & 0x01FFFFFFu), 4);
+                    RUNTIME_LOG("[frustum:ortho] AFTER p2=(" << p2x << ",D " << p2d
+                                << ") p3.D=" << p3d << " p4=(" << p4x << ",D " << p4d
+                                << ") p5.D=" << p5d << "\n");
+                }
+            };
+            if (g_orig6d40c0 != nullptr) runtime.replaceFunction(0x6d40c0u, trace6d40c0);
+        }
 
         // 2026-10-16: ENTRADA vs RETORNO del update de frame FUN_00512ab0. Decide si el que no
         // vuelve es el update (y con el, el bucle de frames) o si el update si retorna y el
@@ -5461,8 +6098,8 @@ namespace
             RUNTIME_LOG("[game_overrides] sceGsSetDefDispEnv (0x4d0df8) env=0x" << std::hex << envAddr);
             ps2_stubs::sceGsSetDefDispEnv(rdram, ctx, runtime);
             if (envAddr != 0 && (envAddr + 40) <= 0x02000000u) {
-                const uint64_t pmode = 0x66u;
-                const uint64_t smode2 = 2u;
+                const uint64_t pmode = 0x8067u;
+                const uint64_t smode2 = 1u;
                 const uint64_t bgcolor = 0u;
                 std::memcpy(rdram + (envAddr & 0x01FFFFFFu), &pmode, 8);
                 std::memcpy(rdram + ((envAddr + 8) & 0x01FFFFFFu), &smode2, 8);
@@ -5480,8 +6117,8 @@ namespace
             RUNTIME_LOG("[game_overrides] sceGsSetDefDispEnv continuation (0x4d0e5c) env=0x" << std::hex << envAddr);
             ps2_stubs::sceGsSetDefDispEnv(rdram, ctx, runtime);
             if (envAddr != 0 && (envAddr + 40) <= 0x02000000u) {
-                const uint64_t pmode = 0x66u;
-                const uint64_t smode2 = 2u;
+                const uint64_t pmode = 0x8067u;
+                const uint64_t smode2 = 1u;
                 const uint64_t bgcolor = 0u;
                 std::memcpy(rdram + (envAddr & 0x01FFFFFFu), &pmode, 8);
                 std::memcpy(rdram + ((envAddr + 8) & 0x01FFFFFFu), &smode2, 8);
