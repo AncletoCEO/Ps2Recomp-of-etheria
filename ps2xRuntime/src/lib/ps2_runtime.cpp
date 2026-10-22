@@ -1520,6 +1520,22 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    // 2026-10-22 (hito 2.1): trace de llamadas al overlay menu.bin. Env-gated.
+    {
+        static const bool s_overlayTrace = std::getenv("SWORD_OVERLAY_TRACE") != nullptr;
+        if (s_overlayTrace && targetPc >= 0x100000u && targetPc < 0x1A2000u)
+        {
+            static std::unordered_set<uint64_t> s_seen;
+            const uint64_t key = (static_cast<uint64_t>(sourcePc) << 32) | targetPc;
+            if (s_seen.insert(key).second)
+            {
+                RUNTIME_LOG("[overlay-call] src=0x" << std::hex << sourcePc
+                            << " tgt=0x" << targetPc << " kind=" << static_cast<int>(kind)
+                            << std::dec);
+            }
+        }
+    }
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.

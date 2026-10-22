@@ -4551,7 +4551,9 @@ namespace
 
                 static uint16_t s_lastButtons = 0;
                 if (buttons != s_lastButtons) {
-                    std::cout << "[pad-host] port=0 buttons=0x" << std::hex << buttons
+                    std::cout << "[pad-host] port=0 ra=0x" << std::hex
+                              << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]))
+                              << " buttons=0x" << buttons
                               << (buttons & 0x0040 ? " [CROSS]" : "")
                               << (buttons & 0x0020 ? " [CIRCLE]" : "")
                               << (buttons & 0x4000 ? " [SQUARE]" : "")
