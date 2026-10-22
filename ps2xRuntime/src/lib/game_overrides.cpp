@@ -2845,6 +2845,31 @@ namespace
             ps2_stubs::sceCdSearchFile(rdram, ctx, runtime);
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
+        // 2026-10-22 (hito 2.1): constructor estatico del overlay menu.bin (OL.BIN,
+        // overlay id 24). El codigo vive en 0x1a1b00 (fuera de la tabla densa del ELF);
+        // sus 7 instrucciones copian gp[-0xAA8] y gp[-0xAA4] a 0x164840/0x1649e0.
+        // HLE equivalente para poder ejecutar el .ctors dinamico sin recompilar el overlay.
+        static auto menuBinCtor = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+            (void)runtime;
+            const uint32_t gp = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[28]));
+            uint32_t a0 = 0u, v1 = 0u;
+            const uint32_t pa = (gp - 0xAA8u) & 0x01FFFFFFu;
+            const uint32_t pv = (gp - 0xAA4u) & 0x01FFFFFFu;
+            if (pa + 4u <= PS2_RAM_SIZE) std::memcpy(&a0, rdram + pa, 4);
+            if (pv + 4u <= PS2_RAM_SIZE) std::memcpy(&v1, rdram + pv, 4);
+            std::memcpy(rdram + 0x00164840u, &a0, 4);
+            std::memcpy(rdram + 0x001649E0u, &v1, 4);
+            static bool s_logged = false;
+            if (!s_logged) {
+                s_logged = true;
+                RUNTIME_LOG("[menu-ctor] 1a1b00 gp=0x" << std::hex << gp
+                            << " a0=0x" << a0 << " v1=0x" << v1 << std::dec);
+            }
+            ctx->r[2] = _mm_setzero_si128();
+            ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
+        };
+        runtime.registerFunction(0x1a1b00u, menuBinCtor);
+
         runtime.replaceFunction(0x004ceb38u, cdSearchFileStub);
         runtime.replaceFunction(0x004cee38u, cdSearchFileStub);
 
@@ -6540,7 +6565,7 @@ namespace
 
             if (s_frameCounter == 1 || s_frameCounter == 10 || s_frameCounter == 30 || s_frameCounter == 60 || s_frameCounter == 120 ||
                 s_frameCounter == 270 || s_frameCounter == 280 || s_frameCounter == 290 ||
-                s_frameCounter == 300 || s_frameCounter == 1800 || s_frameCounter == 1801 ||
+                s_frameCounter == 300 || s_frameCounter == 900 || s_frameCounter == 950 || s_frameCounter == 1000 || s_frameCounter == 1100 || s_frameCounter == 1800 || s_frameCounter == 1801 ||
                 (s_frameCounter % 600) == 0) {
                 const std::string filename = "/home/lubonch/repos/Sword-Of-Etheria-PC-Recomp/work/build-game/frame_" + std::to_string(s_frameCounter) + ".bmp";
                 savePresentationBmp(runtime, filename.c_str());
@@ -6604,6 +6629,11 @@ namespace
                 static int s_autoHold = 0;
                 static int s_autoSecondWait = -1;
                 static bool s_autoDone = false;
+                static uint16_t s_autoMask = 0x4000u; // CROSS
+                static int s_memWait = -1;
+                static int s_memLeftHold = 0;
+                static int s_memCrossWait = -1;
+                static bool s_memDone = false;
                 if (tT3Sub != s_autoSub) {
                     s_autoSub = tT3Sub;
                     s_autoDone = false;
@@ -6611,6 +6641,12 @@ namespace
                     // El selector existe al entrar en 10, pero empieza a aceptar input ~100 frames
                     // despues (la pulsacion medida que funciono cayo ~120 frames mas tarde).
                     s_autoWait = (tT3Sub == 10u) ? 120 : 0;
+                    if (tT3Sub != 2u) {
+                        s_memWait = -1;
+                        s_memLeftHold = 0;
+                        s_memCrossWait = -1;
+                        s_memDone = false;
+                    }
                     PS2SetSyntheticPadMask(0u);
                 }
                 if (!s_autoDone && s_autoWait > 0)
@@ -6627,11 +6663,36 @@ namespace
                 if (s_autoSecondWait > 0) {
                     --s_autoSecondWait;
                     if (s_autoSecondWait == 0) {
+                        s_autoMask = 0x4000u;
                         s_autoHold = 8;
                         RUNTIME_LOG("[autopress] f=" << s_frameCounter << " CROSS (language confirm)");
                     }
                 }
-                const uint16_t pressed = (s_autoHold > 0) ? 0x4000u : 0u; // CROSS (raw PS2, 1 = pulsado)
+                // 2026-10-22: dialogo de memory card (t3sub=2) con el cursor en "No".
+                // LEFT para elegir "Yes", luego CROSS para comenzar sin guardar.
+                if (tT3Sub == 2u && !s_memDone) {
+                    if (s_memWait < 0)
+                        s_memWait = 120;
+                    if (s_memWait > 0) {
+                        --s_memWait;
+                    } else if (s_memLeftHold == 0 && s_memCrossWait < 0) {
+                        s_memLeftHold = 8;
+                        s_memCrossWait = 30;
+                        s_autoMask = 0x0080u; // LEFT
+                        s_autoHold = s_memLeftHold;
+                        RUNTIME_LOG("[autopress] f=" << s_frameCounter << " LEFT (memcard Yes)");
+                    }
+                    if (s_memCrossWait > 0) {
+                        --s_memCrossWait;
+                        if (s_memCrossWait == 0) {
+                            s_autoMask = 0x4000u; // CROSS
+                            s_autoHold = 8;
+                            s_memDone = true;
+                            RUNTIME_LOG("[autopress] f=" << s_frameCounter << " CROSS (memcard begin)");
+                        }
+                    }
+                }
+                const uint16_t pressed = (s_autoHold > 0) ? s_autoMask : 0u; // raw PS2, 1 = pulsado
                 if (s_autoHold > 0)
                     --s_autoHold;
                 PS2SetSyntheticPadMask(pressed);

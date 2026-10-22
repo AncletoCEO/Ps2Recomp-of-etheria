@@ -1121,6 +1121,10 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    // 2026-10-22 (hito 2.1): funciones HLE en direcciones dinamicas fuera de la tabla
+    // densa del ELF (p. ej. constructores de overlays como menu.bin en 0x1a1b00).
+    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> g_dynamicFunctions;
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
@@ -1141,13 +1145,22 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 {
-    return replaceFunction(address, func);
+    uint32_t slot = 0u;
+    if (generatedFunctionTableSlot(address, slot))
+    {
+        g_ps2RecompiledFunctionTable[slot] = func;
+        return true;
+    }
+    g_dynamicFunctions[address] = func;
+    return true;
 }
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
+        return true;
+    return g_dynamicFunctions.find(address) != g_dynamicFunctions.end();
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1182,6 +1195,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
             return fn;
         }
     }
+
+    const auto dyn = g_dynamicFunctions.find(address);
+    if (dyn != g_dynamicFunctions.end())
+        return dyn->second;
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
