@@ -5603,10 +5603,10 @@ namespace
 
         // 2026-10-06l (desbloqueo, temporal): BYPASS de 6E4ED8 (submitter
         // SPU del loop: item, (n<<12)|0x42). Sus callers IGNORAN v0 (usan el
-        // contador s0), así que retornar 0 inmediato es seguro de probar:
-        // si el worker avanza → el waiter SPU vive DENTRO de 6E4ED8 (y se
-        // puede dejar bypasseado en silencio para v0.1.0). Si igual →
-        // revertir (el waiter está en otro lado).
+        // contador s0), así que retornar 0 inmediato es seguro de probar.
+        // 2026-10-22 (hito 2.1): este bypass impedía encolar el tag 0x42 de
+        // finalización de textura; descriptor+0x34 quedaba en 1 y el fade se
+        // colgaba. Ahora nace OFF; sólo se activa con SWORD_BYPASS_6E4ED8=1.
         static auto triage6e4ed8 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             (void)rdram; (void)runtime;
             const uint32_t a0 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
@@ -5618,7 +5618,8 @@ namespace
             ctx->r[2] = _mm_setzero_si128(); // v0 = 0
             ctx->pc = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31]));
         };
-        runtime.replaceFunction(0x6e4ed8u, triage6e4ed8);
+        if (std::getenv("SWORD_BYPASS_6E4ED8") != nullptr)
+            runtime.replaceFunction(0x6e4ed8u, triage6e4ed8);
 
         // Save presentation frame screenshot helper
         static auto savePresentationBmp = [](PS2Runtime *rt, const char *filename) {
