@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #if defined(__linux__)
 #include <csignal>
@@ -1405,6 +1406,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10002000 && address <= 0x10002030)
     {
+        // 2026-10-20 (hito 2.1): la IPU no esta emulada; el trazo prueba si el juego la programa
+        // durante el FMV (libipu recompilado escribe IPU_CMD/FIFO). Env-gated: SWORD_IPU_TRACE=1.
+        if (std::getenv("SWORD_IPU_TRACE") != nullptr)
+        {
+            static uint32_t s_ipuWriteN = 0u;
+            if (s_ipuWriteN++ < 64u)
+                std::cout << "[ipu-w] addr=0x" << std::hex << address << " val=0x" << value
+                          << std::dec << std::endl;
+        }
         if (address == 0x10002010)
         {
             m_ioRegisters[address] = value & ~(1u << 31);
@@ -1528,6 +1538,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t channelBase = address & 0xFFFFFF00;
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+            if (std::getenv("SWORD_DMA_TRACE") != nullptr &&
+                (channelBase == 0x10009000u || channelBase == 0x1000A000u))
+            {
+                static uint32_t s_chN = 0u;
+                std::cout << "[dma-ch] #" << s_chN++ << " chan=0x" << std::hex << channelBase
+                          << " madr=0x" << madr << " qwc=" << std::dec << qwc
+                          << " mode=" << ((value >> 2u) & 3u)
+                          << " chcr=0x" << std::hex << value << std::dec << std::endl;
+            }
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
             // TRIAGE 2026-10-08: histograma por canal DMAC — ¿el juego manda
             // datos de render (VIF1=0x9, GIF=0xA) o solo periféricos?
@@ -1934,6 +1953,13 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
 
 void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
 {
+    if (std::getenv("SWORD_DMA_TRACE") != nullptr)
+    {
+        static uint64_t s_doneN = 0;
+        if (s_doneN++ < 400u || (s_doneN % 500u) == 0u)
+            std::cout << "[dma-done] n=" << s_doneN << " cause=" << cause
+                      << " chan=0x" << std::hex << channelBase << std::dec << std::endl;
+    }
     static constexpr uint32_t kDStat = 0x1000E010u;
     m_ioRegisters[channelBase] &= ~0x100u;
 

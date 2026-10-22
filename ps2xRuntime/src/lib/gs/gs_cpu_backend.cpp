@@ -2203,9 +2203,16 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
             const char *a = std::getenv("SWORD_DUMP_VRAM_AT");
             return (a != nullptr && *a != '\0') ? static_cast<uint32_t>(std::strtoul(a, nullptr, 10)) : 0u;
         }();
-        if (n == 300u || n == 900u || n == 1500u || (s_dumpAt != 0u && n == s_dumpAt))
+        static const uint32_t s_dumpEvery = []() {
+            const char *e = std::getenv("SWORD_DUMP_VRAM_EVERY");
+            return (e != nullptr && *e != '\0') ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+        }();
+        const bool periodic = s_dumpEvery != 0u && (n % s_dumpEvery) == 0u;
+        if (n == 300u || n == 900u || n == 1500u || (s_dumpAt != 0u && n == s_dumpAt) || periodic)
         {
-            const std::string path = std::strcmp(vp, "1") == 0 ? std::string("/tmp/recomp_vram.bin") : std::string(vp);
+            std::string path = std::strcmp(vp, "1") == 0 ? std::string("/tmp/recomp_vram.bin") : std::string(vp);
+            if (periodic)
+                path += "." + std::to_string(n);
             std::ofstream out(path, std::ios::binary);
             if (out && m_vram != nullptr && m_vramSize != 0u)
                 out.write(reinterpret_cast<const char *>(m_vram), m_vramSize);
@@ -2356,10 +2363,11 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
     GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
-    // DIAG 2026-10-18 (Gemini v71 paso 3): el juego NUNCA escribe DISPFB1 (queda en el default del
-    // runtime 0x1400 = fbp 0) pero dibuja en el frame del contexto activo (page 128, que es el DISPFB1
-    // del real). Env-gated: si dispfb1 es el default, presentar el frame del contexto 0.
-    if (std::getenv("SWORD_PRESENT_CTX") != nullptr && request.dispfb1 == 0x1400ull &&
+    // 2026-10-20 (hito 1.6): el juego NUNCA escribe DISPFB1 (queda en el default del runtime
+    // 0x1400 = fbp 0/fbw 10) y dibuja en el frame del contexto activo (page 128). Presentar el
+    // contexto por defecto es la fuente real del frame; SWORD_NO_PRESENT_CTX lo desactiva para A/B.
+    bool forcedDisplayPage0 = false;
+    if (std::getenv("SWORD_NO_PRESENT_CTX") == nullptr && request.dispfb1 == 0x1400ull &&
         request.contextFrames[0].fbw != 0u)
     {
         static bool s_ctxLog = false;
@@ -2370,13 +2378,26 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                       << request.contextFrames[0].fbp << " fbw=" << request.contextFrames[0].fbw
                       << " psm=" << static_cast<uint32_t>(request.contextFrames[0].psm) << std::endl;
         }
-        displayFrame1 = request.contextFrames[0];
+        // 2026-10-20: el contexto activo puede ser page 0x80 (con texto fantasma). El frame
+        // limpio del selector esta en page 0/fbw 8; forzar esa pagina cuando DISPFB1 es default.
+        displayFrame1.fbp = 0u;
+        displayFrame1.fbw = 8u;
+        displayFrame1.psm = 0u;
+        forcedDisplayPage0 = true;
     }
     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
     decodeDisplaySize(request.display1, width1, height1);
     decodeDisplaySize(request.display2, width2, height2);
+    if (forcedDisplayPage0)
+    {
+        // 2026-10-20: el DISPLAY real es 512x511 (eeMemory 0x00A8D0C8: DW=2559, MAGH=4,
+        // DH=510). El stub dejo display1 en 640x448; leer 640 sobre un buffer FBW=8 (512)
+        // desborda 128 px por fila hacia la pagina vecina (el bleed de x~553).
+        width1 = 512u;
+        height1 = 511u;
+    }
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1) &&
                         !(std::getenv("SWORD_NO_CRT1_DEFAULT") != nullptr &&
                           request.dispfb1 == ((0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43)));
@@ -2471,6 +2492,30 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 selected = candidate;
                 pixels.swap(candidatePixels);
                 break;
+            }
+            // 2026-10-20 (hito 1.6): si la pagina 0 sigue vacia, probar la pagina de dibujo 0x80.
+            if (countNonBlackPixels(pixels, width, height) == 0u)
+            {
+                GSFrameReg extra = displayFrame;
+                extra.fbp = 0x80u;
+                extra.fbw = 8u;
+                extra.psm = 0u;
+                std::vector<uint8_t> extraPixels;
+                const bool ok = CopyFrameToHostRgba(extra, width, height, extraPixels, preserveAlpha, true, true, 0u, 0u);
+                if (ok)
+                {
+                    const uint32_t enz = countNonBlackPixels(extraPixels, width, height);
+                    if (logFb)
+                        std::cout << "[present-fb] fallback 0x80 copy=" << ok << " nz=" << enz
+                                  << " (w=" << width << " h=" << height << ")" << std::endl;
+                    if (enz > 0u)
+                    {
+                        selected = extra;
+                        pixels.swap(extraPixels);
+                    }
+                }
+                else if (logFb)
+                    std::cout << "[present-fb] fallback 0x80 copy=0" << std::endl;
             }
             if (logFb)
                 std::cout << "[present-fb] -> selected.fbp=" << selected.fbp

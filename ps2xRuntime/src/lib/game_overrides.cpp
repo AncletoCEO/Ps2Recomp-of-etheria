@@ -23,6 +23,15 @@
 // wrapper del bucle de frame pueda publicar ahi el objeto de fase y Store32 vigilar su flag +8).
 extern uint32_t g_phaseObjectAddr;
 
+// 2026-10-20 (hito 2.1): harness de pulsaciones deterministicas; definido en ps2_pad.cpp.
+extern "C" void PS2SetSyntheticPadMask(uint16_t mask);
+
+// 2026-10-20: sondas legacy que se disparan millones de veces por corrida (DMA y UI). Nacen OFF;
+// se activan con SWORD_TRACE_DMA=1 / SWORD_TRACE_UI=1. Sin esto el log crece ~600 MB en 300 s y
+// frena la corrida, impidiendo llegar al FMV.
+static const bool g_swordTraceDma = std::getenv("SWORD_TRACE_DMA") != nullptr;
+static const bool g_swordTraceUi = std::getenv("SWORD_TRACE_UI") != nullptr;
+
 // 2026-10-19 (hito 1.1): widget que se esta renderizando en 0x6daef0. Lo lee la sonda de
 // dispatchGuestBranch para correlacionar el callback (jalr en 0x6daf6c/0x6dafcc/0x6db02c/0x6db06c)
 // con el widget cuya lista de comandos lo encolo. Solo se toca con SWORD_UI_CB_LOG=1.
@@ -4448,8 +4457,8 @@ namespace
             RUNTIME_LOG("[hit-6e4848] ENTER");
             if (g_origE4848 != nullptr) g_origE4848(rdram, ctx, runtime);
         };
-        if (g_origE4cc0 != nullptr) runtime.replaceFunction(0x6e4cc0u, traceE4cc0wrap);
-        if (g_origE4848 != nullptr) runtime.replaceFunction(0x6e4848u, traceE4848wrap);
+        if (g_swordTraceDma && g_origE4cc0 != nullptr) runtime.replaceFunction(0x6e4cc0u, traceE4cc0wrap);
+        if (g_swordTraceDma && g_origE4848 != nullptr) runtime.replaceFunction(0x6e4848u, traceE4848wrap);
 
         // 2026-10-16 (v63): hooks del selector de fase REAL. Son funciones completas, así que
         // replaceFunction SÍ aplica (a diferencia de los [triage-*] sobre direcciones internas).
@@ -4561,7 +4570,7 @@ namespace
                 RUNTIME_LOG("[ui-clear] AFTER head=0x" << std::hex << headAfter << std::dec);
             }
         };
-        if (g_orig6db0d0 != nullptr) runtime.replaceFunction(0x6db0d0u, trace6db0d0wrap);
+        if (g_swordTraceUi && g_orig6db0d0 != nullptr) runtime.replaceFunction(0x6db0d0u, trace6db0d0wrap);
 
         g_orig6d6a80 = runtime.lookupFunction(0x6d6a80u);
         static auto trace6d6a80wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
@@ -4591,7 +4600,7 @@ namespace
                 RUNTIME_LOG("[ui-insert] AFTER head=0x" << std::hex << headAfter << std::dec);
             }
         };
-        if (g_orig6d6a80 != nullptr) runtime.replaceFunction(0x6d6a80u, trace6d6a80wrap);
+        if (g_swordTraceUi && g_orig6d6a80 != nullptr) runtime.replaceFunction(0x6d6a80u, trace6d6a80wrap);
 
         g_orig6d6290 = runtime.lookupFunction(0x6d6290u);
         static auto trace6d6290wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
@@ -4600,7 +4609,7 @@ namespace
             RUNTIME_LOG("[ui-insert] 0x6d6290 a0=0x" << std::hex << a0 << " ra=0x" << ra << std::dec);
             if (g_orig6d6290 != nullptr) g_orig6d6290(rdram, ctx, runtime);
         };
-        if (g_orig6d6290 != nullptr) runtime.replaceFunction(0x6d6290u, trace6d6290wrap);
+        if (g_swordTraceUi && g_orig6d6290 != nullptr) runtime.replaceFunction(0x6d6290u, trace6d6290wrap);
 
         g_orig6d51b0 = runtime.lookupFunction(0x6d51b0u);
         static auto trace6d51b0wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
@@ -4609,7 +4618,7 @@ namespace
             RUNTIME_LOG("[ui-reset] FUN_006d51b0 ENTER a0=0x" << std::hex << a0 << " ra=0x" << ra << std::dec);
             if (g_orig6d51b0 != nullptr) g_orig6d51b0(rdram, ctx, runtime);
         };
-        if (g_orig6d51b0 != nullptr) runtime.replaceFunction(0x6d51b0u, trace6d51b0wrap);
+        if (g_swordTraceUi && g_orig6d51b0 != nullptr) runtime.replaceFunction(0x6d51b0u, trace6d51b0wrap);
 
         // 2026-10-19 (hito): ¿corre el constructor de widgets del selector?
         //   0x805550: invocado por vtable+0x2DC desde 0x83DD74 (substate 2 de FUN_0083dc40).
@@ -4632,7 +4641,7 @@ namespace
                 RUNTIME_LOG("[ui-widget] 0x805550 EXIT pc=0x" << std::hex << ctx->pc
                             << " v0=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[2])) << std::dec);
         };
-        if (g_orig805550 != nullptr) runtime.replaceFunction(0x805550u, trace805550wrap);
+        if (g_swordTraceUi && g_orig805550 != nullptr) runtime.replaceFunction(0x805550u, trace805550wrap);
 
         g_orig804c50 = runtime.lookupFunction(0x804c50u);
         static auto trace804c50wrap = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
@@ -4650,7 +4659,7 @@ namespace
                 RUNTIME_LOG("[ui-widget] 0x804c50 EXIT pc=0x" << std::hex << ctx->pc
                             << " v0=0x" << static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[2])) << std::dec);
         };
-        if (g_orig804c50 != nullptr) runtime.replaceFunction(0x804c50u, trace804c50wrap);
+        if (g_swordTraceUi && g_orig804c50 != nullptr) runtime.replaceFunction(0x804c50u, trace804c50wrap);
 
         // 2026-10-19 (hito): ¿que ve la rutina de DIBUJO del selector? Si al entrar el centinela
         // 0xA88874 sigue auto-apuntandose, dibuja 0 widgets aunque los inserts hayan ocurrido.
@@ -4670,7 +4679,7 @@ namespace
             }
             if (g_orig83d290 != nullptr) g_orig83d290(rdram, ctx, runtime);
         };
-        if (g_orig83d290 != nullptr) runtime.replaceFunction(0x83d290u, trace83d290wrap);
+        if (g_swordTraceUi && g_orig83d290 != nullptr) runtime.replaceFunction(0x83d290u, trace83d290wrap);
 
         // 2026-10-19 (hito): ¿pasa el render por-widget? Gate 1: 0x6db0d0 itera la cola 0xA88874 y
         // llama a 0x6daef0 por widget. Gate 2: bit 0 de `widget+3` (visible). Gate 3: lista de
@@ -4700,7 +4709,7 @@ namespace
             if (g_orig6daef0 != nullptr) g_orig6daef0(rdram, ctx, runtime);
             g_swordUiCurWidget = prevWidget;
         };
-        if (g_orig6daef0 != nullptr) runtime.replaceFunction(0x6daef0u, trace6daef0wrap);
+        if (g_swordTraceUi && g_orig6daef0 != nullptr) runtime.replaceFunction(0x6daef0u, trace6daef0wrap);
 
         // 2026-10-19 (hito 1.2): atribuir los prims que emite cada callback de render. El tag lo lee
         // GSCpuBackend::DrawPrimitive (SWORD_UI_CB_PRIMS=1). Asi sabemos que PRIM/TEX0/UV/color sale
@@ -5483,7 +5492,7 @@ namespace
                 runtime.replaceFunction(0x6efd28u, triage6efd28hook);
             }
         }
-        runtime.replaceFunction(0x6e4848u, triage4848hook);
+        if (g_swordTraceDma) runtime.replaceFunction(0x6e4848u, triage4848hook);
         static auto triage4c1970 = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
             (void)runtime;
             const uint32_t s4 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[20]));
@@ -5693,7 +5702,9 @@ namespace
             static uint64_t s_syncTick = 0;
             s_syncTick++;
             if (s_syncTick == 1 || s_syncTick == 10 || s_syncTick == 30 || s_syncTick == 60 || s_syncTick == 120 ||
-                s_syncTick == 300 || (s_syncTick % 600) == 0) {
+                s_syncTick == 270 || s_syncTick == 280 || s_syncTick == 290 ||
+                s_syncTick == 300 || s_syncTick == 1800 || s_syncTick == 1801 ||
+                (s_syncTick % 600) == 0) {
                 const std::string filename = "/home/lubonch/repos/Sword-Of-Etheria-PC-Recomp/work/build-game/frame_" + std::to_string(s_syncTick) + ".bmp";
                 savePresentationBmp(runtime, filename.c_str());
             }
@@ -6527,7 +6538,9 @@ namespace
             }
 
             if (s_frameCounter == 1 || s_frameCounter == 10 || s_frameCounter == 30 || s_frameCounter == 60 || s_frameCounter == 120 ||
-                s_frameCounter == 300 || (s_frameCounter % 600) == 0) {
+                s_frameCounter == 270 || s_frameCounter == 280 || s_frameCounter == 290 ||
+                s_frameCounter == 300 || s_frameCounter == 1800 || s_frameCounter == 1801 ||
+                (s_frameCounter % 600) == 0) {
                 const std::string filename = "/home/lubonch/repos/Sword-Of-Etheria-PC-Recomp/work/build-game/frame_" + std::to_string(s_frameCounter) + ".bmp";
                 savePresentationBmp(runtime, filename.c_str());
             }
@@ -6580,6 +6593,47 @@ namespace
                 tEntry = rd32(tLoad + 0x6Cu);
                 tEntryId = rd32(tEntry + 8u);
                 tEntryState = rd32(tEntry + 0xCu) & 0xFFu;
+            }
+            // 2026-10-20 (hito 2.1): avanzar selector (t3sub=10) -> language (t3sub=11) con
+            // pulsaciones deterministas por estado, no por reloj (la velocidad del run varia).
+            // Env-gated: SWORD_AUTOPRESS=1.
+            if (runtime != nullptr && std::getenv("SWORD_AUTOPRESS") != nullptr) {
+                static uint32_t s_autoSub = 0xFFFFFFFFu;
+                static int s_autoWait = 0;
+                static int s_autoHold = 0;
+                static int s_autoSecondWait = -1;
+                static bool s_autoDone = false;
+                if (tT3Sub != s_autoSub) {
+                    s_autoSub = tT3Sub;
+                    s_autoDone = false;
+                    s_autoHold = 0;
+                    // El selector existe al entrar en 10, pero empieza a aceptar input ~100 frames
+                    // despues (la pulsacion medida que funciono cayo ~120 frames mas tarde).
+                    s_autoWait = (tT3Sub == 10u) ? 120 : 0;
+                    PS2SetSyntheticPadMask(0u);
+                }
+                if (!s_autoDone && s_autoWait > 0)
+                    --s_autoWait;
+                if (!s_autoDone && s_autoWait == 0 && tT3Sub == 10u) {
+                    s_autoHold = 8;
+                    s_autoDone = true;
+                    // La pantalla de language dura ~50 frames de estado 11 y luego queda en 0;
+                    // la confirmacion se agenda por frames desde esta pulsacion, no por estado.
+                    s_autoSecondWait = 150;
+                    RUNTIME_LOG("[autopress] f=" << s_frameCounter << " sub=" << tT3Sub
+                                                 << " CROSS (selector)");
+                }
+                if (s_autoSecondWait > 0) {
+                    --s_autoSecondWait;
+                    if (s_autoSecondWait == 0) {
+                        s_autoHold = 8;
+                        RUNTIME_LOG("[autopress] f=" << s_frameCounter << " CROSS (language confirm)");
+                    }
+                }
+                const uint16_t pressed = (s_autoHold > 0) ? 0x4000u : 0u; // CROSS (raw PS2, 1 = pulsado)
+                if (s_autoHold > 0)
+                    --s_autoHold;
+                PS2SetSyntheticPadMask(pressed);
             }
             if (runtime != nullptr && (s_frameCounter <= 3u || (s_frameCounter % 10u) == 0u)) {
                 const EeKernelSnapshot snap = runtime->eeScheduler().snapshot();

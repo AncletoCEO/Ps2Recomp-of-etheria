@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <vector>
 
 namespace
 {
@@ -25,6 +26,29 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    void applySyntheticButton(uint16_t &btns, const char *name)
+    {
+        if (std::strcmp(name, "start") == 0) btns &= ~PAD_START;
+        else if (std::strcmp(name, "cross") == 0) btns &= ~PAD_CROSS;
+        else if (std::strcmp(name, "circle") == 0) btns &= ~PAD_CIRCLE;
+        else if (std::strcmp(name, "square") == 0) btns &= ~PAD_SQUARE;
+        else if (std::strcmp(name, "triangle") == 0) btns &= ~PAD_TRIANGLE;
+        else if (std::strcmp(name, "select") == 0) btns &= ~PAD_SELECT;
+        else if (std::strcmp(name, "up") == 0) btns &= ~PAD_UP;
+        else if (std::strcmp(name, "down") == 0) btns &= ~PAD_DOWN;
+        else if (std::strcmp(name, "left") == 0) btns &= ~PAD_LEFT;
+        else if (std::strcmp(name, "right") == 0) btns &= ~PAD_RIGHT;
+    }
+
+    uint16_t g_syntheticPressedMask = 0u;
+}
+
+// Harness determinista (SWORD_AUTOPRESS): fuerzan botones desde el hook de frame sin pasar
+// por relojes. Convencion PS2: bit a 1 = pulsado.
+extern "C" void PS2SetSyntheticPadMask(uint16_t mask)
+{
+    g_syntheticPressedMask = mask;
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -124,25 +148,60 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     // SWORD_PAD_PRESS=<start|cross|circle|square|triangle|select|up|down|left|right>
     // pulsa un botón de forma permanente (harness headless: sin esto el pad queda neutro).
     // SWORD_PAD_TOGGLE=1 alterna 1 s on / 1 s off para generar flancos (no sólo el inicial).
-    if (const char *pe = std::getenv("SWORD_PAD_PRESS"); pe != nullptr && *pe != '\0')
+    if (const char *pe = std::getenv("SWORD_PAD_PRESS");
+        pe != nullptr && *pe != '\0' && std::getenv("SWORD_PAD_TIMES") == nullptr)
     {
         bool on = true;
         if (std::getenv("SWORD_PAD_TOGGLE") != nullptr)
             on = std::fmod(GetTime(), 2.0) < 1.0;
+        // 2026-10-20: pulsacion unica para el selector/language (press 250 ms a los 5 s) y
+        // despues esperar sin volver a pulsar. SWORD_PAD_ONCE=1.
+        if (const char *once = std::getenv("SWORD_PAD_ONCE"); once != nullptr && *once != '\0')
+        {
+            const double t = GetTime();
+            on = (t >= 5.0 && t < 5.25);
+        }
         if (on)
         {
-            if (std::strcmp(pe, "start") == 0) clearBit(PAD_START);
-            else if (std::strcmp(pe, "cross") == 0) clearBit(PAD_CROSS);
-            else if (std::strcmp(pe, "circle") == 0) clearBit(PAD_CIRCLE);
-            else if (std::strcmp(pe, "square") == 0) clearBit(PAD_SQUARE);
-            else if (std::strcmp(pe, "triangle") == 0) clearBit(PAD_TRIANGLE);
-            else if (std::strcmp(pe, "select") == 0) clearBit(PAD_SELECT);
-            else if (std::strcmp(pe, "up") == 0) clearBit(PAD_UP);
-            else if (std::strcmp(pe, "down") == 0) clearBit(PAD_DOWN);
-            else if (std::strcmp(pe, "left") == 0) clearBit(PAD_LEFT);
-            else if (std::strcmp(pe, "right") == 0) clearBit(PAD_RIGHT);
+            applySyntheticButton(btns, pe);
         }
     }
+
+    // SWORD_PAD_TIMES=<seg,seg,...>: un pulso de 250 ms en cada instante indicado (segundos),
+    // para avanzar fases encadenadas (selector -> language -> FMV) sin dejar el boton sostenido.
+    if (const char *te = std::getenv("SWORD_PAD_TIMES"); te != nullptr && *te != '\0')
+    {
+        static const std::vector<double> s_times = [te]()
+        {
+            std::vector<double> times;
+            const char *cursor = te;
+            while (*cursor != '\0')
+            {
+                char *end = nullptr;
+                const double value = std::strtod(cursor, &end);
+                if (end == cursor)
+                    break;
+                times.push_back(value);
+                cursor = end;
+                if (*cursor == ',')
+                    ++cursor;
+            }
+            return times;
+        }();
+        const double now = GetTime();
+        for (const double start : s_times)
+        {
+            if (now >= start && now < start + 0.25)
+            {
+                const char *button = std::getenv("SWORD_PAD_PRESS");
+                if (button != nullptr && *button != '\0')
+                    applySyntheticButton(btns, button);
+                break;
+            }
+        }
+    }
+
+    btns &= static_cast<uint16_t>(~g_syntheticPressedMask);
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);

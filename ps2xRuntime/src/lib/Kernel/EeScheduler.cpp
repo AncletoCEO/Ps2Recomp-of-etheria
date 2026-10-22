@@ -1305,6 +1305,8 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
 int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 {
     assertExecutor();
+    if (dmac && std::getenv("SWORD_DMAC_TRACE") != nullptr)
+        RUNTIME_LOG("[dmac-enable] cause=" << cause << " enabled=" << (enabled ? 1 : 0));
     if (cause < 32u)
     {
         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
@@ -1324,6 +1326,15 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    static const bool s_dmacTrace = std::getenv("SWORD_DMAC_TRACE") != nullptr;
+    if (dmac && s_dmacTrace)
+    {
+        static uint64_t s_traceN = 0;
+        if (s_traceN++ < 200u || (s_traceN % 200u) == 0u)
+            RUNTIME_LOG("[dmac-irq] cause=" << cause << " mask=0x" << std::hex << mask << std::dec
+                                            << " handlers=" << m_dmacHandlers.size()
+                                            << " enabled=" << (((mask >> cause) & 1u) != 0u ? 1 : 0));
+    }
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
         return;

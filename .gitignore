@@ -23,3 +23,7 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+# Builds locales (no versionar)
+/out-linux/
+/out-windows/
+/out-release/
